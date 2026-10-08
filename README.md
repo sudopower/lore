@@ -98,7 +98,7 @@ If the server lost its copy, or the history was rewritten (for example after a f
 Uncommitted changes are not indexed, and the CLI says so on stderr.
 `--web-url <template>` stores a URL template for links to files, for example `https://github.com/acme/app/blob/{commit}/{path}`. `repo list --json` prints the server's JSON on one line.
 
-To index on every push to main, run it from CI. A GitHub Actions step (the checkout needs the full history only for the first push, `fetch-depth: 0` is the simple choice):
+To index on every push to main, run it from CI. A GitHub Actions step (the checkout needs the full history on every push, so keep `fetch-depth: 0`: a shallow clone that lacks the commits the server has makes the push fail):
 
 ```yaml
 on:
