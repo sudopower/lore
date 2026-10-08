@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use lore::cli::{AdminCommand, Client};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -12,6 +13,20 @@ use tracing_subscriber::EnvFilter;
     about = "Ask questions of your traces, sessions and code"
 )]
 struct Cli {
+    /// Base URL of the lore server (client commands)
+    #[arg(
+        long,
+        global = true,
+        env = "LORE_URL",
+        default_value = "http://localhost:8080"
+    )]
+    url: String,
+    /// Tenant API key (client commands)
+    #[arg(long, global = true, env = "LORE_KEY", hide_env_values = true)]
+    key: Option<String>,
+    /// Admin token (admin commands)
+    #[arg(long, global = true, env = "LORE_ADMIN_TOKEN", hide_env_values = true)]
+    admin_token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -22,20 +37,39 @@ enum Command {
     Serve,
     /// Apply database migrations and exit
     Migrate,
+    /// Manage tenants and API keys (needs the admin token)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+    /// Show the tenant and scopes of the API key
+    Me,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::from_env()?;
-    init_tracing(&config)?;
     match cli.command {
-        Command::Serve => serve(config).await,
+        Command::Serve => {
+            let config = Config::from_env()?;
+            init_tracing(&config)?;
+            serve(config).await
+        }
         Command::Migrate => {
+            let config = Config::from_env()?;
+            init_tracing(&config)?;
             let pool = lore::db::connect(&config.database_url).await?;
             lore::db::migrate(&pool).await?;
             tracing::info!("migrations applied");
             Ok(())
+        }
+        Command::Admin { command } => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_admin(&client, command).await
+        }
+        Command::Me => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_me(&client).await
         }
     }
 }
