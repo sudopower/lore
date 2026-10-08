@@ -101,6 +101,15 @@ fn init_tracing(config: &Config) -> Result<()> {
 }
 
 async fn serve(config: Config) -> Result<()> {
+    // Build the model provider first: a missing key should stop the start before anything else.
+    let (llm, models) = lore::llm::from_config(&config)?;
+    tracing::info!(
+        llm = llm.name(),
+        fast_model = %models.fast.model,
+        deep_model = %models.deep.model,
+        "model provider ready"
+    );
+
     let pool = lore::db::connect(&config.database_url).await?;
     lore::db::migrate(&pool).await?;
 
@@ -128,6 +137,8 @@ async fn serve(config: Config) -> Result<()> {
         pool,
         config: Arc::new(config),
         embedder,
+        llm,
+        models,
         source_locks: Default::default(),
     };
     axum::serve(listener, router(state))

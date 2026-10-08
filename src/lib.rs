@@ -6,6 +6,7 @@ pub mod db;
 pub mod embed;
 pub mod error;
 pub mod http;
+pub mod llm;
 pub mod repo;
 pub mod search;
 pub mod store;

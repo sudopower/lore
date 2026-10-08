@@ -10,6 +10,7 @@ use axum::http::{Request, StatusCode};
 use lore::config::Config;
 use lore::embed::HashEmbedder;
 use lore::http::{AppState, router};
+use lore::llm::{FakeLlm, ModeModel, Models};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -44,6 +45,17 @@ pub fn test_state_with_limit(
         pool,
         config: Arc::new(test_config_with_limit(data_dir, max_bundle_bytes)),
         embedder: Arc::new(HashEmbedder),
+        llm: Arc::new(FakeLlm::new()),
+        models: Models {
+            fast: ModeModel {
+                model: "fake".into(),
+                effort: None,
+            },
+            deep: ModeModel {
+                model: "fake".into(),
+                effort: None,
+            },
+        },
         source_locks: Arc::default(),
     }
 }

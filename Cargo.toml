@@ -6,6 +6,7 @@ rust-version = "1.95"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1.92"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -14,6 +15,7 @@ futures = "0.3"
 hex = "0.4"
 pgvector = { version = "=0.4.1", features = ["sqlx"] }
 rand = "0.8"
+regex = "1.13.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -36,3 +38,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6.5"

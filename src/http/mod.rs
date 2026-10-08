@@ -14,6 +14,7 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
+use crate::llm::{Llm, Models};
 use crate::repo::SourceLocks;
 
 pub mod admin;
@@ -26,6 +27,9 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     pub embedder: Arc<dyn Embedder>,
+    pub llm: Arc<dyn Llm>,
+    /// The model and effort used by each answer mode.
+    pub models: Models,
     /// One lock per source, held while a bundle is ingested.
     pub source_locks: Arc<SourceLocks>,
 }
