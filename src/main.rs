@@ -1,0 +1,103 @@
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use lore::config::{Config, LogFormat};
+use lore::http::{AppState, router};
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(
+    name = "lore",
+    version,
+    about = "Ask questions of your traces, sessions and code"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the HTTP server (applies migrations on start)
+    Serve,
+    /// Apply database migrations and exit
+    Migrate,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Config::from_env()?;
+    init_tracing(&config)?;
+    match cli.command {
+        Command::Serve => serve(config).await,
+        Command::Migrate => {
+            let pool = lore::db::connect(&config.database_url).await?;
+            lore::db::migrate(&pool).await?;
+            tracing::info!("migrations applied");
+            Ok(())
+        }
+    }
+}
+
+fn init_tracing(config: &Config) -> Result<()> {
+    let filter = EnvFilter::try_new(&config.log)
+        .with_context(|| format!("invalid LORE_LOG filter {:?}", config.log))?;
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match config.log_format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder.json().init(),
+    }
+    Ok(())
+}
+
+async fn serve(config: Config) -> Result<()> {
+    let pool = lore::db::connect(&config.database_url).await?;
+    lore::db::migrate(&pool).await?;
+
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
+        .await
+        .with_context(|| format!("binding {}", config.listen_addr))?;
+    tracing::info!(addr = %config.listen_addr, version = %config.version, "lore listening");
+
+    let state = AppState {
+        pool,
+        config: Arc::new(config),
+    };
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("serving")?;
+    tracing::info!("shut down");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
+}
