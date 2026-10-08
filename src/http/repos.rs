@@ -1,0 +1,192 @@
+//! Repo sources: create, list and push a git bundle.
+
+use std::error::Error as StdError;
+
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
+
+use crate::auth::{Caller, Scope};
+use crate::error::AppError;
+use crate::http::{AppJson, AppQuery, AppState};
+use crate::repo::{IndexReport, ingest_bundle, is_full_sha};
+use crate::store::{Source, ensure_source, get_source, list_sources};
+
+#[derive(Deserialize)]
+pub struct CreateRepo {
+    name: String,
+    web_url_template: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RepoItem {
+    id: Uuid,
+    name: String,
+    indexed_commit: Option<String>,
+    web_url_template: Option<String>,
+}
+
+impl From<Source> for RepoItem {
+    fn from(s: Source) -> Self {
+        Self {
+            id: s.id,
+            name: s.name,
+            indexed_commit: s.indexed_commit,
+            web_url_template: s.web_url_template,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct RepoList {
+    repos: Vec<RepoItem>,
+}
+
+#[derive(Deserialize)]
+pub struct BundleQuery {
+    #[serde(rename = "ref")]
+    sha: String,
+    #[serde(default)]
+    full: bool,
+}
+
+/// 1 to 100 characters of `[A-Za-z0-9._-]`.
+fn valid_repo_name(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+pub async fn create_repo(
+    caller: Caller,
+    State(state): State<AppState>,
+    AppJson(req): AppJson<CreateRepo>,
+) -> Result<Json<RepoItem>, AppError> {
+    caller.require(Scope::Ingest)?;
+    if !valid_repo_name(&req.name) {
+        return Err(AppError::BadRequest(
+            "repo name must be 1 to 100 characters of A-Z, a-z, 0-9, . _ and -".to_string(),
+        ));
+    }
+    let source = ensure_source(
+        &state.pool,
+        caller.tenant_id,
+        "repo",
+        &req.name,
+        req.web_url_template.as_deref(),
+    )
+    .await?;
+    Ok(Json(source.into()))
+}
+
+pub async fn list_repos(
+    caller: Caller,
+    State(state): State<AppState>,
+) -> Result<Json<RepoList>, AppError> {
+    caller.require(Scope::Read)?;
+    let sources = list_sources(&state.pool, caller.tenant_id, Some("repo")).await?;
+    Ok(Json(RepoList {
+        repos: sources.into_iter().map(RepoItem::from).collect(),
+    }))
+}
+
+/// True when the error is, or is caused by, the body limit layer's "length limit exceeded".
+fn is_length_limit(e: &(dyn StdError + 'static)) -> bool {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.to_string().contains("length limit exceeded") {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Streams the request body into a new temp file in `<data_dir>/tmp`. The returned path deletes
+/// the file when dropped, so every exit path cleans up.
+async fn spool_body(state: &AppState, body: Body) -> Result<tempfile::TempPath, AppError> {
+    let dir = state.config.data_dir.join("tmp");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("creating the tmp dir")))?;
+    let (file, path) = tempfile::Builder::new()
+        .prefix("upload-")
+        .tempfile_in(&dir)
+        .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("creating a temp file")))?
+        .into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            if is_length_limit(&e) {
+                AppError::PayloadTooLarge
+            } else {
+                AppError::BadRequest("could not read the request body".to_string())
+            }
+        })?;
+        file.write_all(&chunk).await.map_err(|e| {
+            AppError::Internal(anyhow::Error::from(e).context("writing the upload"))
+        })?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("flushing the upload")))?;
+    Ok(path)
+}
+
+pub async fn put_bundle(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    AppQuery(query): AppQuery<BundleQuery>,
+    body: Body,
+) -> Result<Json<IndexReport>, AppError> {
+    caller.require(Scope::Ingest)?;
+    // Another tenant's source, or a source that is not a repo, looks like a missing one.
+    let source = get_source(&state.pool, caller.tenant_id, id)
+        .await?
+        .filter(|s| s.kind == "repo")
+        .ok_or(AppError::NotFound)?;
+    if !is_full_sha(&query.sha) {
+        return Err(AppError::BadRequest(
+            "ref must be a full 40 character lowercase hex commit sha".to_string(),
+        ));
+    }
+
+    let upload = spool_body(&state, body).await?;
+
+    // The ingest runs in its own task: if the client disconnects, it still finishes instead of
+    // stopping halfway. The temp file goes with the task.
+    let task = tokio::spawn(async move {
+        let report = ingest_bundle(&state, &source, &upload, &query.sha, query.full).await;
+        drop(upload);
+        report
+    });
+    let report = task
+        .await
+        .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("ingest task failed")))??;
+    Ok(Json(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_names() {
+        assert!(valid_repo_name("sample"));
+        assert!(valid_repo_name("My_Repo-1.git"));
+        assert!(valid_repo_name(&"a".repeat(100)));
+        assert!(!valid_repo_name(""));
+        assert!(!valid_repo_name(&"a".repeat(101)));
+        assert!(!valid_repo_name("a/b"));
+        assert!(!valid_repo_name("a b"));
+        assert!(!valid_repo_name("repo\u{e9}"));
+        assert!(!valid_repo_name("../x"));
+    }
+}

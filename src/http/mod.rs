@@ -1,29 +1,37 @@
 use std::sync::Arc;
 
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Query, Request, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::http::request::Parts;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
+use crate::repo::SourceLocks;
 
 pub mod admin;
 pub mod me;
+pub mod repos;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     pub embedder: Arc<dyn Embedder>,
+    /// One lock per source, held while a bundle is ingested.
+    pub source_locks: Arc<SourceLocks>,
 }
 
 pub fn router(state: AppState) -> Router {
+    // The limit is on the bundle route only: other routes keep axum's own defaults.
+    let bundle_limit = usize::try_from(state.config.max_bundle_bytes).unwrap_or(usize::MAX);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
@@ -37,6 +45,11 @@ pub fn router(state: AppState) -> Router {
             post(admin::create_key).get(admin::list_keys),
         )
         .route("/v1/admin/keys/{id}", delete(admin::revoke_key))
+        .route("/v1/repos", post(repos::create_repo).get(repos::list_repos))
+        .route(
+            "/v1/repos/{id}/bundle",
+            put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -54,6 +67,24 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(AppJson(v)),
+            Err(rejection) => Err(AppError::BadRequest(rejection.body_text())),
+        }
+    }
+}
+
+/// `Query` with rejections turned into the standard 400 error body.
+pub struct AppQuery<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for AppQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(v)) => Ok(AppQuery(v)),
             Err(rejection) => Err(AppError::BadRequest(rejection.body_text())),
         }
     }
