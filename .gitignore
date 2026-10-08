@@ -1,5 +1,9 @@
 /target
+/data/
 .env
 .env.*
 !.env.example
 .fastembed_cache/
+deploy/.env.prod
+deploy/backups/
+deploy/k8s/overlays/generated/
