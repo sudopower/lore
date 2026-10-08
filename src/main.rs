@@ -89,6 +89,21 @@ async fn serve(config: Config) -> Result<()> {
     let pool = lore::db::connect(&config.database_url).await?;
     lore::db::migrate(&pool).await?;
 
+    // Load the embedder before binding, so the first-start model download finishes before the
+    // server answers anything. Loading is blocking and CPU/network heavy.
+    let started = std::time::Instant::now();
+    let embedder = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || lore::embed::from_config(&config))
+            .await
+            .context("embedder load task failed")??
+    };
+    tracing::info!(
+        embedder = embedder.name(),
+        load_ms = started.elapsed().as_millis() as u64,
+        "embedder ready"
+    );
+
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
         .with_context(|| format!("binding {}", config.listen_addr))?;
@@ -97,6 +112,7 @@ async fn serve(config: Config) -> Result<()> {
     let state = AppState {
         pool,
         config: Arc::new(config),
+        embedder,
     };
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

@@ -12,6 +12,8 @@ pub struct Config {
     pub admin_token: Option<String>,
     pub log: String,
     pub log_format: LogFormat,
+    pub embedder: EmbedderKind,
+    pub embed_model: String,
     pub version: String,
 }
 
@@ -20,6 +22,15 @@ pub enum LogFormat {
     Text,
     Json,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedderKind {
+    Fastembed,
+    Hash,
+}
+
+/// The only embedding model v1 supports.
+pub const EMBED_MODEL: &str = "bge-small-en-v1.5";
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -35,6 +46,18 @@ impl Config {
             other => bail!("LORE_LOG_FORMAT must be \"text\" or \"json\", got {other:?}"),
         };
 
+        let embedder = match get("LORE_EMBEDDER", "fastembed").as_str() {
+            "fastembed" => EmbedderKind::Fastembed,
+            "hash" => EmbedderKind::Hash,
+            other => bail!("LORE_EMBEDDER must be \"fastembed\" or \"hash\", got {other:?}"),
+        };
+        let embed_model = get("LORE_EMBED_MODEL", EMBED_MODEL);
+        if embed_model != EMBED_MODEL {
+            bail!(
+                "LORE_EMBED_MODEL must be {EMBED_MODEL:?} (the only supported model), got {embed_model:?}"
+            );
+        }
+
         Ok(Self {
             database_url: get(
                 "LORE_DATABASE_URL",
@@ -45,6 +68,8 @@ impl Config {
             admin_token: f("LORE_ADMIN_TOKEN").filter(|t| !t.is_empty()),
             log: get("LORE_LOG", "info"),
             log_format,
+            embedder,
+            embed_model,
             version: get("LORE_VERSION", env!("CARGO_PKG_VERSION")),
         })
     }
@@ -73,6 +98,8 @@ mod tests {
         assert_eq!(c.admin_token, None);
         assert_eq!(c.log, "info");
         assert_eq!(c.log_format, LogFormat::Text);
+        assert_eq!(c.embedder, EmbedderKind::Fastembed);
+        assert_eq!(c.embed_model, "bge-small-en-v1.5");
         assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
     }
 
@@ -85,6 +112,8 @@ mod tests {
             ("LORE_ADMIN_TOKEN", "secret"),
             ("LORE_LOG", "debug"),
             ("LORE_LOG_FORMAT", "json"),
+            ("LORE_EMBEDDER", "hash"),
+            ("LORE_EMBED_MODEL", "bge-small-en-v1.5"),
             ("LORE_VERSION", "9.9.9"),
         ])
         .unwrap();
@@ -94,6 +123,7 @@ mod tests {
         assert_eq!(c.admin_token.as_deref(), Some("secret"));
         assert_eq!(c.log, "debug");
         assert_eq!(c.log_format, LogFormat::Json);
+        assert_eq!(c.embedder, EmbedderKind::Hash);
         assert_eq!(c.version, "9.9.9");
     }
 
@@ -107,5 +137,17 @@ mod tests {
     fn bad_log_format_is_an_error() {
         let err = lookup(&[("LORE_LOG_FORMAT", "yaml")]).unwrap_err();
         assert!(err.to_string().contains("LORE_LOG_FORMAT"), "{err}");
+    }
+
+    #[test]
+    fn bad_embedder_is_an_error() {
+        let err = lookup(&[("LORE_EMBEDDER", "openai")]).unwrap_err();
+        assert!(err.to_string().contains("LORE_EMBEDDER"), "{err}");
+    }
+
+    #[test]
+    fn unknown_embed_model_is_an_error() {
+        let err = lookup(&[("LORE_EMBED_MODEL", "all-MiniLM-L6-v2")]).unwrap_err();
+        assert!(err.to_string().contains("LORE_EMBED_MODEL"), "{err}");
     }
 }

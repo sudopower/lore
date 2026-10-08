@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::embed::Embedder;
 use crate::error::AppError;
 
 pub mod admin;
@@ -19,6 +20,7 @@ pub mod me;
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
+    pub embedder: Arc<dyn Embedder>,
 }
 
 pub fn router(state: AppState) -> Router {
