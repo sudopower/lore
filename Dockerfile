@@ -18,7 +18,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM debian:trixie-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 10001 --create-home --home-dir /home/lore lore \
     && mkdir -p /var/lib/lore && chown lore:lore /var/lib/lore

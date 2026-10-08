@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lore-data
+  labels:
+    app: lore
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lore
+  labels:
+    app: lore
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  # One writer of the data dir: stop the old pod before starting the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: lore
+  template:
+    metadata:
+      labels:
+        app: lore
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: lore
+          # The tag is set by the overlay (make kind-deploy).
+          image: lore
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: lore-env
+            - configMapRef:
+                name: lore-config
+          # Allows 3 minutes for the first start, which downloads the embedding model.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          # /livez does not touch the database, so a database blip never restarts the pod.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/lore
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: lore-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lore
+  labels:
+    app: lore
+spec:
+  selector:
+    app: lore
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
