@@ -7,14 +7,14 @@ WORKDIR /src
 # Cache dependencies: build a stub crate first.
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
-    && cargo build --release
+    && cargo build --release --locked
 
 # Build the real sources. Later tickets embed files from migrations/ and tests/fixtures/.
 COPY src ./src
 COPY migrations ./migrations
 COPY tests/fixtures ./tests/fixtures
 # COPY keeps the old mtimes, so without this cargo would reuse the stub build.
-RUN touch src/main.rs src/lib.rs && cargo build --release
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM debian:trixie-slim
 RUN apt-get update \
