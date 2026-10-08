@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lore-config
+  labels:
+    app: lore
+data:
+  LORE_EMBEDDER: fastembed
+  LORE_LLM: fake
+  LORE_LOG_FORMAT: json
+  LORE_DATA_DIR: /var/lib/lore
+  # Unused until T13, which is harmless.
+  LORE_SESSION_QUIET_SECS: "5"

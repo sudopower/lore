@@ -37,6 +37,7 @@ pub struct Client {
 impl Client {
     pub fn new(base: &str, key: Option<String>, admin: Option<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building the HTTP client")?;

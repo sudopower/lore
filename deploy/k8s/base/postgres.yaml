@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lore-db
+  labels:
+    app: lore-db
+spec:
+  serviceName: lore-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lore-db
+  template:
+    metadata:
+      labels:
+        app: lore-db
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: lore
+            - name: POSTGRES_DB
+              value: lore
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: lore-db
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "lore"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lore-db
+  labels:
+    app: lore-db
+spec:
+  selector:
+    app: lore-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

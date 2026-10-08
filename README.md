@@ -27,6 +27,42 @@ make image VERSION=dev   # docker build, tagged lore:dev
 Check it with `curl localhost:8080/healthz`, which returns `{"status":"ok","db":"ok"}`.
 `/livez` is the liveness probe and does not touch the database.
 
+## Deploy to kind
+
+The manifests in `deploy/k8s/base/` run lore and a pgvector Postgres on the kind cluster `factory`. You need `kind`, `kubectl`, Docker and `openssl`. Every `kubectl` call in the Makefile passes `--context kind-factory`, so the current context never matters.
+
+```bash
+make kind-up                          # creates the cluster `factory` if it does not exist
+make image VERSION=dev                # docker build, tagged lore:dev
+make kind-load VERSION=dev            # loads the image into the cluster
+make kind-deploy VERSION=dev          # namespace and secrets if missing, then apply and wait for the rollout
+```
+
+`NS` picks the namespace (default `lore`; use `lore-dev-<name>` for experiments, for example `make kind-deploy NS=lore-dev-t7 VERSION=dev-t7`). `kind-deploy` generates an overlay in `deploy/k8s/overlays/generated/` (gitignored) that sets the image tag, and remembers the previously deployed tag in `.previous-<NS>` there.
+
+| Target | What it does |
+|---|---|
+| `make kind-secret` | Creates the namespace and the secrets `lore-db` and `lore-env` (random password and admin token) if they are missing. Existing secrets are never changed |
+| `make kind-rollback` | Redeploys the previous tag, or runs `kubectl rollout undo` when none is recorded |
+| `make kind-logs` | Last 200 log lines of the lore pod |
+| `make kind-delete NS=lore-dev-<name>` | Deletes a dev namespace. It refuses `lore` and any name that is not `lore-dev-*` |
+
+The first start downloads the embedding model into the `lore-data` volume, and the startup probe allows 3 minutes for it.
+
+Verify the deployment (replace `lore` with your namespace, and `18080` with `18081` for a dev namespace):
+
+```bash
+kubectl --context kind-factory -n lore port-forward svc/lore 18080:80 >/tmp/lore-pf.log 2>&1 &
+sleep 3
+export LORE_URL=http://localhost:18080
+export LORE_ADMIN_TOKEN=$(kubectl --context kind-factory -n lore get secret lore-env -o jsonpath='{.data.LORE_ADMIN_TOKEN}' | base64 -d)
+cargo build --release && export PATH="$PWD/target/release:$PATH"
+curl -s $LORE_URL/healthz            # {"status":"ok","db":"ok"}
+scripts/smoke.sh m1                  # last line: SMOKE M1 OK
+```
+
+`scripts/smoke.sh <stage>` (`m1`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`.
+
 ## Configuration
 
 lore reads these environment variables (all in `src/config.rs`).
