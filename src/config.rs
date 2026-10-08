@@ -14,6 +14,8 @@ pub struct Config {
     pub log_format: LogFormat,
     pub embedder: EmbedderKind,
     pub embed_model: String,
+    /// Largest accepted git bundle upload, in bytes.
+    pub max_bundle_bytes: u64,
     pub version: String,
 }
 
@@ -31,6 +33,9 @@ pub enum EmbedderKind {
 
 /// The only embedding model v1 supports.
 pub const EMBED_MODEL: &str = "bge-small-en-v1.5";
+
+/// Default `LORE_MAX_BUNDLE_BYTES`: 512 MiB.
+pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -58,6 +63,14 @@ impl Config {
             );
         }
 
+        let max_bundle_bytes = match f("LORE_MAX_BUNDLE_BYTES") {
+            None => DEFAULT_MAX_BUNDLE_BYTES,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => bail!("LORE_MAX_BUNDLE_BYTES must be a positive integer, got {v:?}"),
+            },
+        };
+
         Ok(Self {
             database_url: get(
                 "LORE_DATABASE_URL",
@@ -70,6 +83,7 @@ impl Config {
             log_format,
             embedder,
             embed_model,
+            max_bundle_bytes,
             version: get("LORE_VERSION", env!("CARGO_PKG_VERSION")),
         })
     }
@@ -100,6 +114,7 @@ mod tests {
         assert_eq!(c.log_format, LogFormat::Text);
         assert_eq!(c.embedder, EmbedderKind::Fastembed);
         assert_eq!(c.embed_model, "bge-small-en-v1.5");
+        assert_eq!(c.max_bundle_bytes, 512 * 1024 * 1024);
         assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
     }
 
@@ -114,6 +129,7 @@ mod tests {
             ("LORE_LOG_FORMAT", "json"),
             ("LORE_EMBEDDER", "hash"),
             ("LORE_EMBED_MODEL", "bge-small-en-v1.5"),
+            ("LORE_MAX_BUNDLE_BYTES", "1048576"),
             ("LORE_VERSION", "9.9.9"),
         ])
         .unwrap();
@@ -124,6 +140,7 @@ mod tests {
         assert_eq!(c.log, "debug");
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(c.embedder, EmbedderKind::Hash);
+        assert_eq!(c.max_bundle_bytes, 1_048_576);
         assert_eq!(c.version, "9.9.9");
     }
 
@@ -149,5 +166,13 @@ mod tests {
     fn unknown_embed_model_is_an_error() {
         let err = lookup(&[("LORE_EMBED_MODEL", "all-MiniLM-L6-v2")]).unwrap_err();
         assert!(err.to_string().contains("LORE_EMBED_MODEL"), "{err}");
+    }
+
+    #[test]
+    fn bad_max_bundle_bytes_is_an_error() {
+        for bad in ["", "0", "-1", "big", "1.5"] {
+            let err = lookup(&[("LORE_MAX_BUNDLE_BYTES", bad)]).unwrap_err();
+            assert!(err.to_string().contains("LORE_MAX_BUNDLE_BYTES"), "{err}");
+        }
     }
 }

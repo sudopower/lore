@@ -113,6 +113,7 @@ async fn serve(config: Config) -> Result<()> {
         pool,
         config: Arc::new(config),
         embedder,
+        source_locks: Default::default(),
     };
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

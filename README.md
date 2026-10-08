@@ -41,6 +41,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_LOG_FORMAT` | `text` | `text` or `json`. Anything else is a startup error |
 | `LORE_EMBEDDER` | `fastembed` | `fastembed` (bge-small-en-v1.5 on CPU) or `hash` (deterministic, for tests and `make run`). Anything else is a startup error. The first start with `fastembed` downloads about 130 MB into `$LORE_DATA_DIR/models` before the server listens |
 | `LORE_EMBED_MODEL` | `bge-small-en-v1.5` | Embedding model. Only the default is supported in v1; any other value is a startup error |
+| `LORE_MAX_BUNDLE_BYTES` | `536870912` (512 MiB) | Largest accepted body of `PUT /v1/repos/{id}/bundle`; a bigger upload is a 413. Must be a positive integer, otherwise a startup error |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
@@ -62,3 +63,20 @@ lore --key lk_... me                            # {"tenant_id": "...", "tenant_n
 ```
 
 Tenant names are 1 to 64 characters of `a-z`, `0-9` and `-`. Send keys as `Authorization: Bearer lk_...`.
+
+## Repos
+
+A repo source is pushed as a git bundle. The server keeps a bare mirror and a checkout under `$LORE_DATA_DIR/repos/<source id>/`, and needs `git` on its path (the Docker image installs it). Both routes need an `ingest` key; listing needs `read`.
+
+```bash
+curl -X POST localhost:8080/v1/repos -H "Authorization: Bearer $LORE_KEY" \
+  -H 'content-type: application/json' -d '{"name": "sample"}'      # {"id": "...", "name": "sample", ...}
+curl localhost:8080/v1/repos -H "Authorization: Bearer $LORE_KEY"
+git bundle create /tmp/repo.bundle HEAD
+curl -X PUT "localhost:8080/v1/repos/<id>/bundle?ref=$(git rev-parse HEAD)&full=true" \
+  -H "Authorization: Bearer $LORE_KEY" --data-binary @/tmp/repo.bundle
+```
+
+`ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted` and `chunks`.
+
+Symlinks, submodules, binary or non-UTF-8 files, files over 256 KiB, and lock files, build output and vendored directories are skipped and counted in `files_skipped`.

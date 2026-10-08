@@ -180,6 +180,14 @@ pub async fn document_hash(
     .await
 }
 
+/// The external ids of every document of a source.
+pub async fn list_external_ids(pool: &PgPool, source_id: Uuid) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT external_id FROM documents WHERE source_id = $1")
+        .bind(source_id)
+        .fetch_all(pool)
+        .await
+}
+
 /// Replaces all chunks of a document: deletes the old ones, then inserts `chunks` with `ord` set
 /// to the index. Symbols weigh more (A) than the body (B) in the full-text vector. The document
 /// must belong to `tenant_id`, otherwise `NotFound`.

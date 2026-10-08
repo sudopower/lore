@@ -16,19 +16,35 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub fn test_config(data_dir: &Path) -> Config {
+    test_config_with_limit(data_dir, None)
+}
+
+/// Like `test_config`, with `LORE_MAX_BUNDLE_BYTES` set when `max_bundle_bytes` is given.
+pub fn test_config_with_limit(data_dir: &Path, max_bundle_bytes: Option<u64>) -> Config {
     Config::from_lookup(|k| match k {
         "LORE_DATA_DIR" => Some(data_dir.to_string_lossy().into_owned()),
         "LORE_ADMIN_TOKEN" => Some("t".to_string()),
+        "LORE_MAX_BUNDLE_BYTES" => max_bundle_bytes.map(|n| n.to_string()),
         _ => None,
     })
     .expect("test config is valid")
 }
 
 pub fn test_state(pool: PgPool, data_dir: &Path) -> AppState {
+    test_state_with_limit(pool, data_dir, None)
+}
+
+/// A state whose bundle upload limit is `max_bundle_bytes` (the default when `None`).
+pub fn test_state_with_limit(
+    pool: PgPool,
+    data_dir: &Path,
+    max_bundle_bytes: Option<u64>,
+) -> AppState {
     AppState {
         pool,
-        config: Arc::new(test_config(data_dir)),
+        config: Arc::new(test_config_with_limit(data_dir, max_bundle_bytes)),
         embedder: Arc::new(HashEmbedder),
+        source_locks: Arc::default(),
     }
 }
 
@@ -143,4 +159,66 @@ pub async fn body_json(res: axum::response::Response) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+/// Sends a request with a bearer key and returns the status and the JSON body (`Null` when the
+/// body is empty or not JSON).
+pub async fn send(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, body_json(res).await)
+}
+
+/// `POST /v1/repos` with the given name. Returns the status and the JSON body.
+pub async fn create_repo(router: &Router, key: &str, name: &str) -> (StatusCode, Value) {
+    let body = json!({ "name": name }).to_string().into_bytes();
+    send(router, "POST", "/v1/repos", key, body).await
+}
+
+/// `PUT /v1/repos/{id}/bundle` with the given bytes. Returns the status and the JSON body.
+pub async fn put_bundle(
+    router: &Router,
+    key: &str,
+    source_id: Uuid,
+    bytes: Vec<u8>,
+    sha: &str,
+    full: bool,
+) -> (StatusCode, Value) {
+    let uri = format!("/v1/repos/{source_id}/bundle?ref={sha}&full={full}");
+    let req = Request::put(uri)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(bytes))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, body_json(res).await)
+}
+
+/// Creates the source `sample` and pushes a full bundle of a fresh `fixture_repo()` with
+/// `ref = head`. Returns the source id and the repo (so a test can commit more and push again).
+pub async fn push_fixture(router: &Router, key: &str) -> (Uuid, tempfile::TempDir) {
+    let (status, repo_json) = create_repo(router, key, "sample").await;
+    assert_eq!(status, StatusCode::OK, "create repo: {repo_json}");
+    let source_id: Uuid = repo_json["id"].as_str().unwrap().parse().unwrap();
+    let repo = fixture_repo();
+    let sha = head(&repo);
+    let bytes = bundle(&repo, &["HEAD"]);
+    let (status, report) = put_bundle(router, key, source_id, bytes, &sha, true).await;
+    assert_eq!(status, StatusCode::OK, "push fixture: {report}");
+    assert_eq!(report["indexed_commit"], sha.as_str());
+    (source_id, repo)
 }
