@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lore::cli::{AdminCommand, Client, RepoCommand};
+use lore::cli::{AdminCommand, Client, RepoCommand, SearchArgs};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -49,6 +49,8 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Search the tenant's indexed code, docs, sessions and notes (needs an API key)
+    Search(SearchArgs),
 }
 
 #[tokio::main]
@@ -79,6 +81,10 @@ async fn main() -> Result<()> {
         Command::Repo { command } => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
             lore::cli::run_repo(&client, command).await
+        }
+        Command::Search(args) => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_search(&client, args).await
         }
     }
 }

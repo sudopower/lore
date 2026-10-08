@@ -6,9 +6,11 @@ use serde::Serialize;
 
 pub mod client;
 pub mod repo;
+pub mod search;
 
 pub use client::{Auth, Client};
 pub use repo::{RepoCommand, run_repo};
+pub use search::{SearchArgs, run_search};
 
 #[derive(Subcommand)]
 pub enum AdminCommand {

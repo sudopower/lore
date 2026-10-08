@@ -7,4 +7,5 @@ pub mod embed;
 pub mod error;
 pub mod http;
 pub mod repo;
+pub mod search;
 pub mod store;
