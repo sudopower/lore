@@ -38,14 +38,14 @@ make kind-load VERSION=dev            # loads the image into the cluster
 make kind-deploy VERSION=dev          # namespace and secrets if missing, then apply and wait for the rollout
 ```
 
-`NS` picks the namespace (default `lore`; use `lore-dev-<name>` for experiments, for example `make kind-deploy NS=lore-dev-t7 VERSION=dev-t7`). `kind-deploy` generates an overlay in `deploy/k8s/overlays/generated/` (gitignored) that sets the image tag, and remembers the previously deployed tag in `.previous-<NS>` there.
+`NS` picks the namespace (default `lore`; use `lore-dev-<name>` for experiments, for example `make kind-deploy NS=lore-dev-t7 VERSION=dev-t7`). `kind-deploy` generates an overlay in `deploy/k8s/overlays/generated/` (gitignored) that sets the image tag, and remembers the previously deployed tag in `.previous-<NS>` there (written only after the new rollout succeeds). Use a new `VERSION` for every build: kind loads images by tag and the Deployment does not change when the tag does not, so a rebuilt image under the same tag is not picked up. `NS` must be one word of lowercase letters, digits and `-`.
 
 | Target | What it does |
 |---|---|
 | `make kind-secret` | Creates the namespace and the secrets `lore-db` and `lore-env` (random password and admin token) if they are missing. Existing secrets are never changed |
 | `make kind-rollback` | Redeploys the previous tag, or runs `kubectl rollout undo` when none is recorded |
 | `make kind-logs` | Last 200 log lines of the lore pod |
-| `make kind-delete NS=lore-dev-<name>` | Deletes a dev namespace. It refuses `lore` and any name that is not `lore-dev-*` |
+| `make kind-delete NS=lore-dev-<name>` | Deletes a dev namespace. It refuses `lore`, any name that is not `lore-dev-*`, and any value with a space or other character outside `[a-z0-9-]` |
 
 The first start downloads the embedding model into the `lore-data` volume, and the startup probe allows 3 minutes for it.
 

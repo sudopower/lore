@@ -74,7 +74,7 @@ stage_m1() {
   assert_jq "$R" '.files_indexed == 1' "second push should index exactly 1 file"
 
   S=$(LORE_KEY=$KB lore search "plan limits" --json) || fail "search as the second tenant failed"
-  assert_jq "$S" '(.hits | length) == 0' "the second tenant should get 0 hits"
+  assert_jq "$S" '(.hits | type) == "array" and (.hits | length) == 0' "the second tenant should get 0 hits"
 
   echo "SMOKE M1 OK"
 }
