@@ -52,6 +52,19 @@ pub fn test_router(state: AppState) -> Router {
     router(state)
 }
 
+/// Serves `router` on a random local port (`127.0.0.1:0`) and returns its base URL, for tests
+/// that talk to it over real HTTP, such as the CLI tests.
+pub async fn serve_router(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a local port");
+    let addr = listener.local_addr().expect("local address");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
 /// Creates a tenant and one key with the given scopes through the admin routes (admin token
 /// `"t"`). Returns the tenant id and the plaintext key.
 pub async fn create_tenant_key(router: &Router, name: &str, scopes: &[&str]) -> (Uuid, String) {

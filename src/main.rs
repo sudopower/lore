@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lore::cli::{AdminCommand, Client};
+use lore::cli::{AdminCommand, Client, RepoCommand};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -44,6 +44,11 @@ enum Command {
     },
     /// Show the tenant and scopes of the API key
     Me,
+    /// Index git repos and list them (needs an API key)
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +75,10 @@ async fn main() -> Result<()> {
         Command::Me => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
             lore::cli::run_me(&client).await
+        }
+        Command::Repo { command } => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_repo(&client, command).await
         }
     }
 }

@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
@@ -66,7 +66,7 @@ const SKIP_SUFFIXES: [&str; 13] = [
 const BUNDLE_HEADERS: [&[u8]; 2] = [b"# v2 git bundle\n", b"# v3 git bundle\n"];
 
 /// What one bundle push did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexReport {
     pub indexed_commit: String,
     pub files_indexed: usize,
