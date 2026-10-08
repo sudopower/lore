@@ -33,7 +33,9 @@ image:
 # into several kubectl arguments.
 export NS
 CHECK_NS = $(if $(word 2,$(NS)),$(error NS must be one word, got '$(NS)'),$(if $(filter lore lore-dev-%,$(NS)),,$(error NS must be lore or lore-dev-*, got '$(NS)')))
-GUARD_NS = case "$$NS" in *[!a-z0-9-]*|"") echo "NS must be lore or lore-dev-*"; exit 1 ;; lore|lore-dev-?*) ;; *) echo "NS must be lore or lore-dev-*"; exit 1 ;; esac
+# The character class is spelled out: a-z also matches capitals in some locales.
+GUARD_NS = case "$$NS" in *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|"") echo "NS must be lore or lore-dev-*"; exit 1 ;; lore|lore-dev-?*) ;; *) echo "NS must be lore or lore-dev-*"; exit 1 ;; esac
+GUARD_VERSION = case "$(VERSION)" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*|"") echo "VERSION must be letters, digits, . _ -"; exit 1 ;; esac
 
 kind-up:
 	kind get clusters | grep -qx factory || kind create cluster --name factory
@@ -59,29 +61,35 @@ kind-secret:
 			--from-literal=LORE_DATABASE_URL="postgres://lore:$$pw@lore-db:5432/lore"; \
 	fi
 
+# Per worktree and per NS, $(GEN) records two tags, written only after a rollout succeeds:
+# .current-<NS> is the last tag that rolled out, .previous-<NS> the one it replaced.
 kind-deploy: kind-secret
+	@: $(CHECK_NS)
+	@$(GUARD_NS)
+	@$(GUARD_VERSION)
 	mkdir -p $(GEN)
 	printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../../base\nnamespace: $(NS)\nimages:\n  - name: lore\n    newName: lore\n    newTag: "$(VERSION)"\n' > $(GEN)/kustomization.yaml
-	@rm -f $(GEN)/.pending-$(NS); \
-	img=$$(kubectl $(KCTX) -n $(NS) get deploy lore -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true); \
-	case "$$img" in \
-		*:*) tag=$${img##*:}; \
-			if [ "$$tag" != "$(VERSION)" ]; then echo "$$tag" > $(GEN)/.pending-$(NS); fi ;; \
-	esac
 	kubectl $(KCTX) apply -k $(GEN)
 	kubectl $(KCTX) -n $(NS) rollout status deploy/lore --timeout=300s
-	@if [ -f $(GEN)/.pending-$(NS) ]; then \
-		mv $(GEN)/.pending-$(NS) $(GEN)/.previous-$(NS); \
-		echo "previous tag $$(cat $(GEN)/.previous-$(NS)) saved to $(GEN)/.previous-$(NS)"; \
+	@cur=$$(cat $(GEN)/.current-$(NS) 2>/dev/null || true); \
+	if [ "$$cur" != "$(VERSION)" ]; then \
+		if [ -n "$$cur" ]; then echo "$$cur" > $(GEN)/.previous-$(NS); echo "previous tag $$cur saved to $(GEN)/.previous-$(NS)"; fi; \
+		echo "$(VERSION)" > $(GEN)/.current-$(NS); \
 	fi
 
+# Goes back to .current when the live tag is something else (the last rollout failed),
+# otherwise to .previous. With no record it falls back to the cluster's own undo.
 kind-rollback:
 	@: $(CHECK_NS)
 	@$(GUARD_NS)
-	@prev=$$(cat $(GEN)/.previous-$(NS) 2>/dev/null || true); \
-	if [ -n "$$prev" ]; then \
-		echo "rolling back $(NS) to $$prev"; \
-		make kind-deploy NS=$(NS) VERSION=$$prev; \
+	@live=$$(kubectl $(KCTX) -n $(NS) get deploy lore -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true); \
+	live=$${live##*:}; \
+	cur=$$(cat $(GEN)/.current-$(NS) 2>/dev/null || true); \
+	prev=$$(cat $(GEN)/.previous-$(NS) 2>/dev/null || true); \
+	if [ -n "$$cur" ] && [ -n "$$live" ] && [ "$$live" != "$$cur" ]; then target=$$cur; else target=$$prev; fi; \
+	if [ -n "$$target" ]; then \
+		echo "rolling back $(NS) to $$target"; \
+		make kind-deploy NS=$(NS) VERSION=$$target; \
 	else \
 		kubectl $(KCTX) -n $(NS) rollout undo deploy/lore \
 			&& kubectl $(KCTX) -n $(NS) rollout status deploy/lore --timeout=300s; \
@@ -96,5 +104,5 @@ kind-logs:
 # or holding a character outside [a-z0-9-] (a space would make kubectl delete several).
 kind-delete:
 	@: $(CHECK_NS)
-	@case "$$NS" in *[!a-z0-9-]*|"") echo "kind-delete is for dev namespaces only"; exit 1 ;; lore-dev-?*) ;; *) echo "kind-delete is for dev namespaces only"; exit 1 ;; esac
+	@case "$$NS" in *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|"") echo "kind-delete is for dev namespaces only"; exit 1 ;; lore-dev-?*) ;; *) echo "kind-delete is for dev namespaces only"; exit 1 ;; esac
 	kubectl $(KCTX) delete namespace $(NS) --wait=false
