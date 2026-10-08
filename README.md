@@ -36,7 +36,27 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_DATABASE_URL` | `postgres://lore:lore@localhost:5434/lore` | Postgres connection string |
 | `LORE_LISTEN_ADDR` | `0.0.0.0:8080` | Address the HTTP server binds |
 | `LORE_DATA_DIR` | `./data` | Directory for repos and downloaded models |
-| `LORE_ADMIN_TOKEN` | unset | Admin bearer token. An empty value counts as unset |
+| `LORE_ADMIN_TOKEN` | unset | Admin bearer token. On the server, an empty value counts as unset and the admin API answers 403. The CLI reads it as the default of `--admin-token` |
 | `LORE_LOG` | `info` | Log filter, in `tracing` `EnvFilter` syntax |
 | `LORE_LOG_FORMAT` | `text` | `text` or `json`. Anything else is a startup error |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
+| `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
+| `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
+
+## Tenants and keys
+
+lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates tenants and keys. Without it the admin API answers 403.
+
+The CLI talks to the server over HTTP. `--url`, `--key` and `--admin-token` are global flags (env `LORE_URL`, `LORE_KEY`, `LORE_ADMIN_TOKEN`), and every subcommand prints the server's JSON.
+
+```bash
+export LORE_ADMIN_TOKEN=dev-admin               # with `make run` going in another shell
+lore admin tenant create --name demo            # {"id": "...", "name": "demo"}
+lore admin tenant list
+lore admin key create --tenant <id>             # {"id": "...", "key": "lk_...", ...}; add --scopes read to limit it
+lore admin key list --tenant <id>               # prefixes only, never the key or its hash
+lore admin key revoke <key-id>                  # the key stops working at once
+lore --key lk_... me                            # {"tenant_id": "...", "tenant_name": "demo", "scopes": [...]}
+```
+
+Tenant names are 1 to 64 characters of `a-z`, `0-9` and `-`. Send keys as `Authorization: Bearer lk_...`.
