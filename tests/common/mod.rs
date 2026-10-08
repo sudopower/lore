@@ -7,6 +7,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lore::config::Config;
+use lore::embed::HashEmbedder;
 use lore::http::{AppState, router};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -26,6 +27,7 @@ pub fn test_state(pool: PgPool, data_dir: &Path) -> AppState {
     AppState {
         pool,
         config: Arc::new(test_config(data_dir)),
+        embedder: Arc::new(HashEmbedder),
     }
 }
 
