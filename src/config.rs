@@ -17,6 +17,29 @@ pub struct Config {
     /// Largest accepted git bundle upload, in bytes.
     pub max_bundle_bytes: u64,
     pub version: String,
+    /// Which model provider answers questions (`LORE_LLM`).
+    pub llm: LlmKind,
+    /// `ANTHROPIC_API_KEY`. Required when `llm` is `Anthropic`; checked by `llm::from_config`.
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_base_url: String,
+    pub fast_model: String,
+    /// `None` when `LORE_FAST_EFFORT` is set to the empty string: no effort is sent.
+    pub fast_effort: Option<String>,
+    pub deep_model: String,
+    /// `None` when `LORE_DEEP_EFFORT` is set to the empty string: no effort is sent.
+    pub deep_effort: Option<String>,
+    /// `LORE_OPENAI_BASE_URL`. Required when `llm` is `Openai`; checked by `llm::from_config`.
+    pub openai_base_url: Option<String>,
+    /// `LORE_OPENAI_MODEL`. Required when `llm` is `Openai`; checked by `llm::from_config`.
+    pub openai_model: Option<String>,
+    pub openai_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmKind {
+    Anthropic,
+    Openai,
+    Fake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +56,12 @@ pub enum EmbedderKind {
 
 /// The only embedding model v1 supports.
 pub const EMBED_MODEL: &str = "bge-small-en-v1.5";
+
+/// Default model for both answer modes.
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+
+/// Default `ANTHROPIC_BASE_URL`.
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 
 /// Default `LORE_MAX_BUNDLE_BYTES`: 512 MiB.
 pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
@@ -71,6 +100,25 @@ impl Config {
             },
         };
 
+        let llm = match get("LORE_LLM", "anthropic").as_str() {
+            "anthropic" => LlmKind::Anthropic,
+            "openai" => LlmKind::Openai,
+            "fake" => LlmKind::Fake,
+            other => bail!("LORE_LLM must be \"anthropic\", \"openai\" or \"fake\", got {other:?}"),
+        };
+        // An unset variable means the default, an empty one means "send no effort".
+        let effort = |key: &str, default: &str| {
+            let v = get(key, default);
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        };
+        // A set but empty value counts as unset.
+        let non_empty = |key: &str| {
+            f(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
         Ok(Self {
             database_url: get(
                 "LORE_DATABASE_URL",
@@ -85,6 +133,16 @@ impl Config {
             embed_model,
             max_bundle_bytes,
             version: get("LORE_VERSION", env!("CARGO_PKG_VERSION")),
+            llm,
+            anthropic_api_key: non_empty("ANTHROPIC_API_KEY"),
+            anthropic_base_url: get("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
+            fast_model: get("LORE_FAST_MODEL", DEFAULT_MODEL),
+            fast_effort: effort("LORE_FAST_EFFORT", "low"),
+            deep_model: get("LORE_DEEP_MODEL", DEFAULT_MODEL),
+            deep_effort: effort("LORE_DEEP_EFFORT", "medium"),
+            openai_base_url: non_empty("LORE_OPENAI_BASE_URL"),
+            openai_model: non_empty("LORE_OPENAI_MODEL"),
+            openai_api_key: non_empty("LORE_OPENAI_API_KEY"),
         })
     }
 }
@@ -116,6 +174,60 @@ mod tests {
         assert_eq!(c.embed_model, "bge-small-en-v1.5");
         assert_eq!(c.max_bundle_bytes, 512 * 1024 * 1024);
         assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(c.llm, LlmKind::Anthropic);
+        assert_eq!(c.anthropic_api_key, None);
+        assert_eq!(c.anthropic_base_url, "https://api.anthropic.com");
+        assert_eq!(c.fast_model, "claude-opus-5-5");
+        assert_eq!(c.fast_effort.as_deref(), Some("low"));
+        assert_eq!(c.deep_model, "claude-opus-5-5");
+        assert_eq!(c.deep_effort.as_deref(), Some("medium"));
+        assert_eq!(c.openai_base_url, None);
+        assert_eq!(c.openai_model, None);
+        assert_eq!(c.openai_api_key, None);
+    }
+
+    #[test]
+    fn llm_settings_are_read() {
+        let c = lookup(&[
+            ("LORE_LLM", "openai"),
+            ("ANTHROPIC_API_KEY", "test-key"),
+            ("ANTHROPIC_BASE_URL", "http://localhost:1"),
+            ("LORE_FAST_MODEL", "claude-haiku-4-5"),
+            ("LORE_FAST_EFFORT", "high"),
+            ("LORE_DEEP_MODEL", "claude-sonnet-5-5"),
+            ("LORE_DEEP_EFFORT", "max"),
+            ("LORE_OPENAI_BASE_URL", "http://localhost:8081/v1"),
+            ("LORE_OPENAI_MODEL", "qwen"),
+            ("LORE_OPENAI_API_KEY", "test-key"),
+        ])
+        .unwrap();
+        assert_eq!(c.llm, LlmKind::Openai);
+        assert_eq!(c.anthropic_api_key.as_deref(), Some("test-key"));
+        assert_eq!(c.anthropic_base_url, "http://localhost:1");
+        assert_eq!(c.fast_model, "claude-haiku-4-5");
+        assert_eq!(c.fast_effort.as_deref(), Some("high"));
+        assert_eq!(c.deep_model, "claude-sonnet-5-5");
+        assert_eq!(c.deep_effort.as_deref(), Some("max"));
+        assert_eq!(
+            c.openai_base_url.as_deref(),
+            Some("http://localhost:8081/v1")
+        );
+        assert_eq!(c.openai_model.as_deref(), Some("qwen"));
+        assert_eq!(c.openai_api_key.as_deref(), Some("test-key"));
+        assert_eq!(lookup(&[("LORE_LLM", "fake")]).unwrap().llm, LlmKind::Fake);
+    }
+
+    #[test]
+    fn empty_effort_means_none() {
+        let c = lookup(&[("LORE_FAST_EFFORT", ""), ("LORE_DEEP_EFFORT", "")]).unwrap();
+        assert_eq!(c.fast_effort, None);
+        assert_eq!(c.deep_effort, None);
+    }
+
+    #[test]
+    fn bad_llm_is_an_error() {
+        let err = lookup(&[("LORE_LLM", "gpt")]).unwrap_err();
+        assert!(err.to_string().contains("LORE_LLM"), "{err}");
     }
 
     #[test]
