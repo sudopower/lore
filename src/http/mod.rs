@@ -19,6 +19,7 @@ use crate::repo::SourceLocks;
 pub mod admin;
 pub mod me;
 pub mod repos;
+pub mod search;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +51,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/repos/{id}/bundle",
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
         )
+        .route("/v1/search", get(search::get_search))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

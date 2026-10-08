@@ -86,6 +86,17 @@ impl Client {
         Self::json(res).await
     }
 
+    /// Like `get_json`, with query parameters that are percent-encoded for the URL.
+    pub async fn get_json_query<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        auth: Auth,
+        query: &[(&str, String)],
+    ) -> Result<T> {
+        let res = Self::send(self.request(Method::GET, path, auth)?.query(query)).await?;
+        Self::json(res).await
+    }
+
     pub async fn post_json<B, T>(&self, path: &str, auth: Auth, body: &B) -> Result<T>
     where
         B: serde::Serialize + ?Sized,
