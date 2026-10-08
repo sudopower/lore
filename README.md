@@ -50,7 +50,7 @@ lore reads these environment variables (all in `src/config.rs`).
 
 lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates tenants and keys. Without it the admin API answers 403.
 
-The CLI talks to the server over HTTP. `--url`, `--key` and `--admin-token` are global flags (env `LORE_URL`, `LORE_KEY`, `LORE_ADMIN_TOKEN`), and every subcommand prints the server's JSON.
+The CLI talks to the server over HTTP. `--url`, `--key` and `--admin-token` are global flags (env `LORE_URL`, `LORE_KEY`, `LORE_ADMIN_TOKEN`), and the `admin` and `me` subcommands print the server's JSON.
 
 ```bash
 export LORE_ADMIN_TOKEN=dev-admin               # with `make run` going in another shell
@@ -80,3 +80,41 @@ curl -X PUT "localhost:8080/v1/repos/<id>/bundle?ref=$(git rev-parse HEAD)&full=
 `ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted` and `chunks`.
 
 Symlinks, submodules, binary or non-UTF-8 files, files over 256 KiB, and lock files, build output and vendored directories are skipped and counted in `files_skipped`.
+
+## Index a repo
+
+`lore repo push` indexes the committed HEAD of a local git repo. It needs `git` on the path and an `ingest` key.
+
+```bash
+export LORE_URL=http://localhost:8080 LORE_KEY=lk_...
+lore repo push . --name sample          # indexed sample at 1a2b3c4: 6 indexed, 0 unchanged, 0 deleted, 1 skipped, 31 chunks
+lore repo push ~/code/app --json        # the report as one line of JSON
+lore repo list                          # name, short indexed commit and web URL template, one repo per line
+```
+
+`PATH` defaults to `.` and can be any directory inside the repo. `--name` defaults to the name of the repo's top level directory.
+The first push sends the whole history. Later pushes send only the commits the server lacks, and when the server already has HEAD nothing is sent and the report is all zeros.
+If the server lost its copy, or the history was rewritten (for example after a force push), the CLI falls back to a full bundle by itself. `--full` forces one.
+Uncommitted changes are not indexed, and the CLI says so on stderr.
+`--web-url <template>` stores a URL template for links to files, for example `https://github.com/acme/app/blob/{commit}/{path}`. `repo list --json` prints the server's JSON on one line.
+
+To index on every push to main, run it from CI. A GitHub Actions step (the checkout needs the full history only for the first push, `fetch-depth: 0` is the simple choice):
+
+```yaml
+on:
+  push:
+    branches: [main]
+jobs:
+  lore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Index the repo in lore
+        run: lore --url $LORE_URL --key ${{ secrets.LORE_KEY }} repo push . --name <repo>
+        env:
+          LORE_URL: ${{ vars.LORE_URL }}
+```
+
+The `lore` binary has to be on the runner (build it with `cargo install --path .` or copy a release binary).

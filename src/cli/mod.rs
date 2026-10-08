@@ -5,8 +5,10 @@ use clap::Subcommand;
 use serde::Serialize;
 
 pub mod client;
+pub mod repo;
 
 pub use client::{Auth, Client};
+pub use repo::{RepoCommand, run_repo};
 
 #[derive(Subcommand)]
 pub enum AdminCommand {
