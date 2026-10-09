@@ -37,7 +37,7 @@ make prod-local-down       # stops the stack and deletes its volumes
 Caddy blocks `/v1/admin`, so admin commands run on the server. The container already has `LORE_ADMIN_TOKEN` in its environment:
 
 ```sh
-ssh <host> 'cd /opt/lore && docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name glassflow'
+ssh <host> 'cd /opt/lore && VERSION=<deployed tag> LORE_DOMAIN=<domain> docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name glassflow'
 ```
 
 Everything else (`repo push`, `search`, `ask`, MCP) goes through `https://<domain>` with a tenant key.
@@ -50,12 +50,15 @@ To restore, on the server. The dump only creates objects, so loading it over a d
 
 ```sh
 cd /opt/lore
+export VERSION=<deployed tag> LORE_DOMAIN=<domain>
 C="docker compose --env-file .env.prod -f compose.prod.yml"
-$C stop lore backup
-$C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
-gunzip -c backups/<file> | $C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore
+$C stop lore backup &&
+$C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' &&
+gunzip -c backups/<file> | $C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore &&
 $C up -d --wait
 ```
+
+`compose.prod.yml` refuses to load without `VERSION` and `LORE_DOMAIN`, so set them to the values of the running deployment first; without them the first command fails before anything is changed. The steps are chained with `&&`, so a failed load never reaches `up`.
 
 The dump creates the `vector` extension again, so nothing else is needed. `ON_ERROR_STOP=1` makes psql stop at the first error instead of exiting 0 over a half-loaded database.
 
