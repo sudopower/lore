@@ -25,9 +25,15 @@ use crate::error::AppError;
 pub const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The rows of one request may hold at most this many bytes of resource, attributes and events
-/// (the resource counted once per span). Without it a small body with a large resource and many
-/// spans multiplies the resource far beyond the body.
+/// (the resource counted once per span), plus `SPAN_ROW_OVERHEAD_BYTES` per stored span. Without
+/// it a small body with a large resource and many spans multiplies the resource far beyond the
+/// body.
 pub const MAX_ROW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A fixed cost counted toward `MAX_ROW_BYTES` for every stored span, for the ids, times, name
+/// and index entries that a row costs whatever its attributes hold. A minimal span costs about
+/// 740 bytes in the database, so this caps a request of tiny spans at about 131,000 spans.
+pub const SPAN_ROW_OVERHEAD_BYTES: u64 = 512;
 
 /// A session id longer than this is cut and gets a hash of the whole id, so it still fits a
 /// btree key.
@@ -131,7 +137,8 @@ pub struct Converted {
 
 /// One row per valid span. A span whose trace id is not 16 bytes, whose span id is not 8 bytes, or
 /// whose parent id is neither empty nor 8 bytes cannot be keyed, so it is counted in `rejected`.
-/// More than `MAX_ROW_BYTES` of row data in one request is `PayloadTooLarge`.
+/// More than `MAX_ROW_BYTES` of row data in one request (the JSON of the resource, attributes and
+/// events of each stored span, plus `SPAN_ROW_OVERHEAD_BYTES` for each) is `PayloadTooLarge`.
 pub fn to_rows(req: &ExportTraceServiceRequest) -> Result<Converted, AppError> {
     let mut rows = Vec::new();
     let mut rejected = 0;
@@ -154,7 +161,10 @@ pub fn to_rows(req: &ExportTraceServiceRequest) -> Result<Converted, AppError> {
                     continue;
                 }
                 let row = span_row(span, &resource);
-                total += resource_bytes + json_len(&row.attributes) + json_len(&row.events);
+                total += SPAN_ROW_OVERHEAD_BYTES
+                    + resource_bytes
+                    + json_len(&row.attributes)
+                    + json_len(&row.events);
                 if total > MAX_ROW_BYTES {
                     return Err(AppError::PayloadTooLarge);
                 }
@@ -572,6 +582,38 @@ mod tests {
             to_rows(&spans(70)),
             Err(AppError::PayloadTooLarge)
         ));
+    }
+
+    #[test]
+    fn each_span_costs_a_fixed_amount_toward_the_cap() {
+        // Tiny spans: 2 bytes of resource, 2 of attributes and 2 of events, plus the fixed cost.
+        let per_span = SPAN_ROW_OVERHEAD_BYTES + 6;
+        let fits = (MAX_ROW_BYTES / per_span) as usize;
+        let spans = |n: usize| -> ExportTraceServiceRequest {
+            let mut req = request(vec![], span(vec![]));
+            let one = req.resource_spans[0].scope_spans[0].spans[0].clone();
+            req.resource_spans[0].scope_spans[0].spans = (0..n)
+                .map(|i| Span {
+                    span_id: (i as u64 + 1).to_be_bytes().to_vec(),
+                    ..one.clone()
+                })
+                .collect();
+            req
+        };
+        assert_eq!(to_rows(&spans(fits)).unwrap().rows.len(), fits);
+        assert!(matches!(
+            to_rows(&spans(fits + 1)),
+            Err(AppError::PayloadTooLarge)
+        ));
+        // Rejected spans are not stored and cost nothing.
+        let mut req = spans(fits);
+        let bad = Span {
+            span_id: vec![],
+            ..req.resource_spans[0].scope_spans[0].spans[0].clone()
+        };
+        req.resource_spans[0].scope_spans[0].spans.push(bad);
+        let converted = to_rows(&req).unwrap();
+        assert_eq!((converted.rows.len(), converted.rejected), (fits, 1));
     }
 
     const HEX_JSON: &str = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{

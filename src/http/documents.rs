@@ -29,6 +29,9 @@ const MAX_EXTERNAL_ID_BYTES: usize = 512;
 const MAX_TITLE_BYTES: usize = 1024;
 /// A search hit repeats the uri, so it is capped like the title.
 const MAX_URI_BYTES: usize = 2048;
+/// A search hit carries `metadata.path`, so it is capped like the uri (a string by its length,
+/// any other JSON value by its serialized length).
+const MAX_PATH_BYTES: usize = crate::search::MAX_PATH_BYTES;
 /// Length of the serialized metadata object.
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 /// Chunks per document. Each one is embedded, so this bounds the work a 1 MiB text can cause.
@@ -176,6 +179,18 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
             at("metadata"),
             MAX_METADATA_BYTES / 1024
         )));
+    }
+    if let Some(path) = metadata.get("path") {
+        let len = match path {
+            Value::String(s) => s.len(),
+            other => other.to_string().len(),
+        };
+        if len > MAX_PATH_BYTES {
+            return Err(bad(format!(
+                "{} is over {MAX_PATH_BYTES} bytes",
+                at("metadata.path")
+            )));
+        }
     }
     let strings = [
         &doc.external_id,
@@ -420,6 +435,27 @@ mod tests {
         let mut d = doc("a");
         d.uri = Some(String::new());
         assert!(prepare(0, d).is_ok());
+    }
+
+    #[test]
+    fn metadata_path_has_a_size_limit_in_bytes() {
+        let with_path = |path: Value| {
+            let mut d = doc("a");
+            d.metadata = Some(json!({ "path": path }));
+            d
+        };
+        assert!(prepare(0, with_path(json!("p".repeat(MAX_PATH_BYTES)))).is_ok());
+        let m = message(prepare(0, with_path(json!("p".repeat(MAX_PATH_BYTES + 1)))));
+        assert!(
+            m.contains("documents[0].metadata.path") && m.contains("2048"),
+            "{m}"
+        );
+        // Bytes, not characters.
+        assert!(prepare(0, with_path(json!("\u{e9}".repeat(MAX_PATH_BYTES / 2 + 1)))).is_err());
+        // Any JSON type counts by its serialized length.
+        assert!(prepare(0, with_path(json!(["x".repeat(MAX_PATH_BYTES)]))).is_err());
+        assert!(prepare(0, with_path(json!(7))).is_ok());
+        assert!(prepare(0, with_path(Value::Null)).is_ok());
     }
 
     #[test]
