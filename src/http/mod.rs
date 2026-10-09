@@ -18,6 +18,8 @@ use crate::llm::{Llm, Models};
 use crate::repo::SourceLocks;
 
 pub mod admin;
+pub mod ask;
+pub mod info;
 pub mod me;
 pub mod repos;
 pub mod search;
@@ -56,6 +58,8 @@ pub fn router(state: AppState) -> Router {
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
         )
         .route("/v1/search", get(search::get_search))
+        .route("/v1/ask", post(ask::post_ask))
+        .route("/v1/info", get(info::info))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
