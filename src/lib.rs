@@ -12,5 +12,6 @@ pub mod mcp;
 pub mod otlp;
 pub mod repo;
 pub mod search;
+pub mod sessions;
 pub mod store;
 pub mod web;

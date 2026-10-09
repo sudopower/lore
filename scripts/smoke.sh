@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for a running lore server.
 #
-#   scripts/smoke.sh <stage>      stage is m1, m2, or all (every defined stage_* function, in order)
+#   scripts/smoke.sh <stage>      stage is m1, m2, m4, or all (every defined stage_* function, in order)
 #
 # Needs LORE_URL and LORE_ADMIN_TOKEN in the environment, and lore, jq and git on PATH.
 # Each run creates fresh tenants, so it can be repeated against the same server.
@@ -98,11 +98,43 @@ stage_m2() {
   echo "SMOKE M2 OK"
 }
 
+# M4: agent sessions posted as OTLP traces become searchable session documents. The server needs
+# a short LORE_SESSION_QUIET_SECS (the default of 60 would make the poll below time out).
+stage_m4() {
+  local K R S A i
+
+  K=$(new_tenant otlp) || exit 1
+
+  R=$(LORE_KEY=$K lore otlp send tests/fixtures/otlp/claude_code_session.json) || fail "otlp send (json) failed"
+  printf '%s' "$R" | grep -q 'HTTP 200' || fail "otlp send (json) should print HTTP 200, got: $R"
+  R=$(LORE_KEY=$K lore otlp send tests/fixtures/otlp/claude_code_session.json --protobuf) \
+    || fail "otlp send (protobuf) failed"
+  printf '%s' "$R" | grep -q 'HTTP 200' || fail "otlp send (protobuf) should print HTTP 200, got: $R"
+
+  S=""
+  for i in $(seq 1 15); do
+    S=$(LORE_KEY=$K lore search "how many plans" --kind session --json) || fail "search failed"
+    if printf '%s' "$S" | jq -e '.hits[0].kind == "session" and (.hits[0].title | startswith("How many plans"))' >/dev/null 2>&1; then
+      break
+    fi
+    [ "$i" -lt 15 ] && sleep 2
+  done
+  assert_jq "$S" '.hits[0].kind == "session" and (.hits[0].title | startswith("How many plans"))' \
+    "the posted session should become a session document within 30s"
+
+  A=$(LORE_KEY=$K lore ask --mode fast "which session had an error in the Grep tool?" --json) \
+    || fail "ask failed"
+  assert_jq "$A" '[.citations[].kind] | index("session") != null' "the answer should cite a session"
+
+  # (d) documents: added in T14
+  echo "SMOKE M4 OK"
+}
+
 main() {
   local stage=${1:-} fn missing=""
   case "$stage" in
     m[0-9] | all) ;;
-    *) fail "usage: scripts/smoke.sh <stage> (m1, m2, or all)" ;;
+    *) fail "usage: scripts/smoke.sh <stage> (m1, m2, m4, or all)" ;;
   esac
 
   [ -n "${LORE_URL:-}" ] || missing="$missing LORE_URL"

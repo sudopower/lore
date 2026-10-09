@@ -36,6 +36,9 @@ pub struct Config {
     /// `LORE_MCP_ALLOWED_HOSTS`: the `Host` values the MCP endpoint accepts. `None` (unset or
     /// empty) turns the host check off.
     pub mcp_allowed_hosts: Option<Vec<String>>,
+    /// `LORE_SESSION_QUIET_SECS`: how long a session must have no new spans before it is
+    /// turned into a searchable document. 0 means as soon as the worker runs.
+    pub session_quiet_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,9 @@ pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default `LORE_MAX_BUNDLE_BYTES`: 512 MiB.
 pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Default `LORE_SESSION_QUIET_SECS`.
+pub const DEFAULT_SESSION_QUIET_SECS: u64 = 60;
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -100,6 +106,16 @@ impl Config {
             Some(v) => match v.trim().parse::<u64>() {
                 Ok(n) if n > 0 => n,
                 _ => bail!("LORE_MAX_BUNDLE_BYTES must be a positive integer, got {v:?}"),
+            },
+        };
+
+        let session_quiet_secs = match f("LORE_SESSION_QUIET_SECS") {
+            None => DEFAULT_SESSION_QUIET_SECS,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    bail!("LORE_SESSION_QUIET_SECS must be a non-negative integer, got {v:?}")
+                }
             },
         };
 
@@ -147,6 +163,7 @@ impl Config {
             openai_model: non_empty("LORE_OPENAI_MODEL"),
             openai_api_key: non_empty("LORE_OPENAI_API_KEY"),
             mcp_allowed_hosts: parse_hosts(f("LORE_MCP_ALLOWED_HOSTS").as_deref()),
+            session_quiet_secs,
         })
     }
 }
@@ -201,6 +218,23 @@ mod tests {
         assert_eq!(c.openai_model, None);
         assert_eq!(c.openai_api_key, None);
         assert_eq!(c.mcp_allowed_hosts, None);
+        assert_eq!(c.session_quiet_secs, 60);
+    }
+
+    #[test]
+    fn session_quiet_secs_is_read() {
+        let c = lookup(&[("LORE_SESSION_QUIET_SECS", " 0 ")]).unwrap();
+        assert_eq!(c.session_quiet_secs, 0);
+        let c = lookup(&[("LORE_SESSION_QUIET_SECS", "300")]).unwrap();
+        assert_eq!(c.session_quiet_secs, 300);
+    }
+
+    #[test]
+    fn bad_session_quiet_secs_is_an_error() {
+        for bad in ["", "-1", "soon", "1.5"] {
+            let err = lookup(&[("LORE_SESSION_QUIET_SECS", bad)]).unwrap_err();
+            assert!(err.to_string().contains("LORE_SESSION_QUIET_SECS"), "{err}");
+        }
     }
 
     #[test]

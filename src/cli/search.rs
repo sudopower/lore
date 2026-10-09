@@ -31,6 +31,7 @@ pub struct SearchArgs {
 /// The parts of a hit the plain output uses.
 #[derive(Deserialize)]
 struct Hit {
+    kind: String,
     title: String,
     path: Option<String>,
     start_line: Option<i32>,
@@ -75,12 +76,13 @@ pub async fn run_search(client: &Client, args: SearchArgs) -> Result<()> {
 }
 
 /// `path:start-end  (score 0.032)  symbols`, then the first 3 snippet lines indented by 4
-/// spaces. Without a path the title takes its place, and without symbols the last column is
-/// left out. Every line ends with a newline.
+/// spaces. Without a path the title takes its place (`session <title>` for a session), and
+/// without symbols the last column is left out. Every line ends with a newline.
 fn format_hit(hit: &Hit) -> String {
     let place = match (&hit.path, hit.start_line, hit.end_line) {
         (Some(path), Some(start), Some(end)) => format!("{path}:{start}-{end}"),
         (Some(path), _, _) => path.clone(),
+        (None, _, _) if hit.kind == "session" => format!("session {}", hit.title),
         (None, _, _) => hit.title.clone(),
     };
     let mut head = format!("{place}  (score {:.3})", hit.score);
@@ -102,6 +104,7 @@ mod tests {
 
     fn hit() -> Hit {
         Hit {
+            kind: "code".to_string(),
             title: "Standup notes".to_string(),
             path: Some("src/billing/plans.rs".to_string()),
             start_line: Some(7),
@@ -142,5 +145,21 @@ mod tests {
         h.symbols.clear();
         h.snippet = String::new();
         assert_eq!(format_hit(&h), "src/billing/plans.rs  (score 0.033)\n");
+    }
+
+    #[test]
+    fn session_hit_is_marked_with_its_kind() {
+        let mut h = hit();
+        h.kind = "session".to_string();
+        h.title = "How many plans do we have?".to_string();
+        h.path = None;
+        h.start_line = None;
+        h.end_line = None;
+        h.symbols.clear();
+        h.snippet = "user: How many plans do we have?".to_string();
+        assert_eq!(
+            format_hit(&h),
+            "session How many plans do we have?  (score 0.033)\n    user: How many plans do we have?\n"
+        );
     }
 }

@@ -1,0 +1,266 @@
+mod common;
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use chrono::{DateTime, Utc};
+use common::{create_tenant_key, send, test_router, test_state_with};
+use lore::http::AppState;
+use lore::search::{SearchQuery, search};
+use lore::sessions::{dequeue_if_unchanged, process_due_sessions};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+const CLAUDE_CODE: &str = include_str!("fixtures/otlp/claude_code_session.json");
+const SESSION_ID: &str = "sess-fixture-1";
+
+struct Env {
+    state: AppState,
+    router: Router,
+    tenant: Uuid,
+    key: String,
+    _data: tempfile::TempDir,
+}
+
+impl Env {
+    async fn new(pool: PgPool, quiet_secs: u64) -> Env {
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state_with(pool, data.path(), |cfg| cfg.session_quiet_secs = quiet_secs);
+        let router = test_router(state.clone());
+        let (tenant, key) = create_tenant_key(&router, "acme", &["ingest", "read"]).await;
+        Env {
+            state,
+            router,
+            tenant,
+            key,
+            _data: data,
+        }
+    }
+
+    async fn post(&self, body: &str) {
+        let req = Request::post("/v1/traces")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", self.key))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = self.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    async fn queue_len(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM session_queue WHERE tenant_id = $1")
+            .bind(self.tenant)
+            .fetch_one(&self.state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn last_span_at(&self) -> DateTime<Utc> {
+        sqlx::query_scalar(
+            "SELECT last_span_at FROM session_queue WHERE tenant_id = $1 AND session_id = $2",
+        )
+        .bind(self.tenant)
+        .bind(SESSION_ID)
+        .fetch_one(&self.state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// `(updated_at, content_hash)` of the session document.
+    async fn document_stamp(&self) -> (DateTime<Utc>, String) {
+        sqlx::query_as(
+            "SELECT updated_at, content_hash FROM documents
+             WHERE tenant_id = $1 AND kind = 'session' AND external_id = $2",
+        )
+        .bind(self.tenant)
+        .bind(SESSION_ID)
+        .fetch_one(&self.state.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn sessions_found(&self, q: &str) -> Vec<lore::search::Hit> {
+        search(
+            &self.state.pool,
+            self.state.embedder.clone(),
+            SearchQuery {
+                tenant_id: self.tenant,
+                q: q.to_string(),
+                k: 5,
+                kinds: Some(vec!["session".to_string()]),
+                source: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_posted_session_becomes_a_searchable_document(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    env.post(CLAUDE_CODE).await;
+    assert_eq!(env.queue_len().await, 1);
+
+    assert_eq!(process_due_sessions(&env.state, 20).await.unwrap(), 1);
+    assert_eq!(env.queue_len().await, 0);
+
+    let hits = env.sessions_found("how many plans").await;
+    let first = hits.first().expect("a session hit");
+    assert_eq!(first.kind, "session");
+    assert!(first.title.starts_with("How many plans"), "{}", first.title);
+    assert_eq!(first.path, None);
+    assert_eq!(first.uri, None);
+    assert_eq!(first.external_id.as_deref(), Some(SESSION_ID));
+
+    // The HTTP reply carries the session id too.
+    let (status, body) = send(
+        &env.router,
+        "GET",
+        "/v1/search?q=how%20many%20plans&kind=session",
+        &env.key,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"][0]["kind"], "session");
+    assert_eq!(body["hits"][0]["external_id"], SESSION_ID);
+    assert!(body["hits"][0]["path"].is_null());
+    assert!(body["hits"][0]["uri"].is_null());
+
+    let (_, hash) = env.document_stamp().await;
+    assert_eq!(hash.len(), 64);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unchanged_session_is_not_indexed_again(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    env.post(CLAUDE_CODE).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let before = env.document_stamp().await;
+
+    // The same spans again queue the session, but the rendered text is the same.
+    env.post(CLAUDE_CODE).await;
+    assert_eq!(env.queue_len().await, 1);
+    assert_eq!(process_due_sessions(&env.state, 20).await.unwrap(), 1);
+    assert_eq!(env.queue_len().await, 0);
+    assert_eq!(env.document_stamp().await, before);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_changed_session_is_indexed_again(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    env.post(CLAUDE_CODE).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let before = env.document_stamp().await;
+
+    env.post(&CLAUDE_CODE.replace("There are three plans", "There are four plans"))
+        .await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let after = env.document_stamp().await;
+    assert_ne!(after.1, before.1);
+    assert!(after.0 > before.0);
+
+    let hits = env.sessions_found("there are four plans").await;
+    assert!(hits[0].text.contains("four plans"), "{}", hits[0].text);
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE tenant_id = $1 AND kind = 'session'",
+    )
+    .bind(env.tenant)
+    .fetch_one(&env.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(documents, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_session_that_is_still_active_waits(pool: PgPool) {
+    let env = Env::new(pool, 3600).await;
+    env.post(CLAUDE_CODE).await;
+    assert_eq!(process_due_sessions(&env.state, 20).await.unwrap(), 0);
+    assert_eq!(env.queue_len().await, 1);
+    assert!(env.sessions_found("how many plans").await.is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn new_spans_keep_the_queue_row(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    env.post(CLAUDE_CODE).await;
+    let read = env.last_span_at().await;
+
+    // A span arrives after the worker read the row: its delete must not remove the row.
+    env.post(CLAUDE_CODE).await;
+    let removed = dequeue_if_unchanged(&env.state.pool, env.tenant, SESSION_ID, read)
+        .await
+        .unwrap();
+    assert!(!removed);
+    assert_eq!(env.queue_len().await, 1);
+
+    let current = env.last_span_at().await;
+    assert!(current > read);
+    let removed = dequeue_if_unchanged(&env.state.pool, env.tenant, SESSION_ID, current)
+        .await
+        .unwrap();
+    assert!(removed);
+    assert_eq!(env.queue_len().await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn another_tenants_session_is_not_found(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    let (other, _) = create_tenant_key(&env.router, "other", &["read"]).await;
+    env.post(CLAUDE_CODE).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let hits = search(
+        &env.state.pool,
+        env.state.embedder.clone(),
+        SearchQuery {
+            tenant_id: other,
+            q: "how many plans".to_string(),
+            k: 5,
+            kinds: None,
+            source: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(hits.is_empty());
+}
+
+/// The fixture with every span marked as an unfinished snapshot.
+fn all_pending() -> String {
+    let mut v: serde_json::Value = serde_json::from_str(CLAUDE_CODE).unwrap();
+    for rs in v["resourceSpans"].as_array_mut().unwrap() {
+        for ss in rs["scopeSpans"].as_array_mut().unwrap() {
+            for span in ss["spans"].as_array_mut().unwrap() {
+                span["attributes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "key": "glassflow.span.pending",
+                        "value": { "boolValue": true }
+                    }));
+            }
+        }
+    }
+    v.to_string()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_session_of_pending_spans_only_is_not_indexed(pool: PgPool) {
+    let env = Env::new(pool, 0).await;
+    env.post(&all_pending()).await;
+    assert_eq!(env.queue_len().await, 1);
+
+    process_due_sessions(&env.state, 20).await.unwrap();
+    assert_eq!(env.queue_len().await, 0);
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE tenant_id = $1 AND kind = 'session'",
+    )
+    .bind(env.tenant)
+    .fetch_one(&env.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(documents, 0);
+}
