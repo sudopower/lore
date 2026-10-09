@@ -4,10 +4,12 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde::Serialize;
 
+pub mod ask;
 pub mod client;
 pub mod repo;
 pub mod search;
 
+pub use ask::{AskArgs, run_ask};
 pub use client::{Auth, Client};
 pub use repo::{RepoCommand, run_repo};
 pub use search::{SearchArgs, run_search};

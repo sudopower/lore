@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for a running lore server.
 #
-#   scripts/smoke.sh <stage>      stage is m1, or all (every defined stage_* function, in order)
+#   scripts/smoke.sh <stage>      stage is m1, m2, or all (every defined stage_* function, in order)
 #
 # Needs LORE_URL and LORE_ADMIN_TOKEN in the environment, and lore, jq and git on PATH.
 # Each run creates fresh tenants, so it can be repeated against the same server.
@@ -79,11 +79,30 @@ stage_m1() {
   echo "SMOKE M1 OK"
 }
 
+# M2: a cited fast-mode answer. Run against the fake model, so the answer is deterministic.
+stage_m2() {
+  local K D A
+
+  K=$(new_tenant ask) || exit 1
+  D=$(fixture_dir) || exit 1
+
+  LORE_KEY=$K lore repo push "$D" --name sample --json >/dev/null || fail "push failed"
+
+  A=$(LORE_KEY=$K lore ask --mode fast "how many plans are there and what are their limits?" --json) \
+    || fail "ask failed"
+  assert_jq "$A" '.mode == "fast"' "the answer should be in fast mode"
+  assert_jq "$A" '.model == "fake"' "the answer should come from the fake model"
+  assert_jq "$A" '[.citations[].path] | index("src/billing/plans.rs") != null' "the answer should cite src/billing/plans.rs"
+  assert_jq "$A" '.latency_ms < 5000' "the answer should take under 5 seconds"
+
+  echo "SMOKE M2 OK"
+}
+
 main() {
   local stage=${1:-} fn missing=""
   case "$stage" in
     m[0-9] | all) ;;
-    *) fail "usage: scripts/smoke.sh <stage> (m1, or all)" ;;
+    *) fail "usage: scripts/smoke.sh <stage> (m1, m2, or all)" ;;
   esac
 
   [ -n "${LORE_URL:-}" ] || missing="$missing LORE_URL"

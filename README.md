@@ -59,9 +59,10 @@ export LORE_ADMIN_TOKEN=$(kubectl --context kind-factory -n lore get secret lore
 cargo build --release && export PATH="$PWD/target/release:$PATH"
 curl -s $LORE_URL/healthz            # {"status":"ok","db":"ok"}
 scripts/smoke.sh m1                  # last line: SMOKE M1 OK
+scripts/smoke.sh m2                  # last line: SMOKE M2 OK
 ```
 
-`scripts/smoke.sh <stage>` (`m1`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`.
+`scripts/smoke.sh <stage>` (`m1`, `m2`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`.
 
 ## Configuration
 
@@ -191,3 +192,35 @@ The `web_url_template` of a repo source can use `{path}`, `{commit}`, `{start}` 
 How it ranks: the query is run twice, once against the Postgres full-text index (any query word may match, ranked with `ts_rank_cd`) and once against the pgvector embeddings (cosine distance). Each run keeps its best 50 chunks. The two lists are merged with Reciprocal Rank Fusion: a chunk scores the sum of `1 / (60 + rank)` over the lists it is in, so the score is at most about 0.033 and is only good for comparing hits of one search. Ties go to the better full-text rank, then to the lower chunk id. A query with only stop words (`the and of`) has no full-text part and is answered from the vectors alone. Identifiers such as `MaxSeatsPerPlan` are also indexed as the words `max seats per plan`, so a search for "seats" finds them.
 
 The CLI prints, for each hit, `path:start-end  (score 0.032)  symbols` (the title when there is no path), then the first 3 snippet lines indented by 4 spaces. `--json` prints the server's JSON on one line. No hits prints `no results` on stderr and exits 0.
+
+## Ask
+
+`POST /v1/ask` answers a question from the key's tenant, with numbered citations. It needs a `read` key. Fast mode runs one hybrid search (the same as `/v1/search`), puts the best passages in a prompt as numbered sources, and makes one model call.
+
+```bash
+curl localhost:8080/v1/ask -H "Authorization: Bearer $LORE_KEY" -H 'content-type: application/json' \
+  -d '{"question": "how many plans are there and what are their limits?"}'
+lore ask "how many plans are there and what are their limits?"     # the same, from the CLI
+lore ask "who owns billing?" --kind doc,note --k 8 --source sample
+lore ask "how many plans are there?" --json                        # the server's JSON on one line
+```
+
+| Field | Meaning |
+|---|---|
+| `question` | Required. A missing or blank question is a 400. At most 2000 characters, otherwise a 400 |
+| `mode` | `fast` (the default) or `deep`. `deep` is a 400 ("deep mode is not available yet") until it exists |
+| `k` | How many sources to retrieve, default 12, clamped to 1 to 50 |
+| `kind` | A list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
+| `source` | Only the source with this name |
+
+The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens` and `output_tokens`.
+
+When nothing indexed matches, the answer is "I found nothing indexed that matches this question.", `model` is `"none"` and the model is not called. If the model declines to answer, the response is a 422 `{"error": "the model declined to answer"}`.
+
+The CLI prints the answer, a blank line, a `Sources:` list with `[label] path:start-end` (the title when there is no path) and the link on the next line, then a dim line `<model> · <latency> ms · <input> in / <output> out`. With `LORE_LLM=fake` the answer is `Fake answer from N sources.` followed by `[1] [2]` and so on: it exercises the plumbing without a model.
+
+`GET /v1/info` needs no key. It reports what the server runs, for clients and health dashboards:
+
+```bash
+curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"hash","modes":["fast"]}
+```
