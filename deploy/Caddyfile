@@ -1,0 +1,6 @@
+{$LORE_DOMAIN} {
+    encode gzip
+    @admin path /v1/admin/*
+    respond @admin "admin API is not exposed; use docker compose exec" 403
+    reverse_proxy lore:8080
+}

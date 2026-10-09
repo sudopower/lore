@@ -66,6 +66,10 @@ scripts/mcp_smoke.sh                 # last line: MCP SMOKE OK
 
 `scripts/smoke.sh <stage>` (`m1`, `m2`, `m4`, `m5`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq`, `git` and `curl` on the path. It creates fresh tenants on each run. It also works against `make run`. `scripts/mcp_smoke.sh` checks the MCP endpoint (see [Use lore from agents](#use-lore-from-agents)); it needs `curl` as well.
 
+## Self-hosting
+
+To run lore on your own VPS with Caddy for HTTPS and a daily backup, see [docs/self-hosting.md](docs/self-hosting.md). `make prod-local` rehearses the same stack on your machine.
+
 ## Configuration
 
 lore reads these environment variables (all in `src/config.rs`).

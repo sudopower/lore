@@ -1,0 +1,73 @@
+# Production stack: lore, Postgres with pgvector, Caddy for HTTPS, a daily pg_dump.
+# Every compose command passes --env-file .env.prod (see docs/self-hosting.md): only
+# that flag feeds the ${...} values below, env_file: does not.
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: lore
+      POSTGRES_DB: lore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  lore:
+    image: lore:${VERSION:?set VERSION}
+    env_file: .env.prod
+    environment:
+      LORE_DATABASE_URL: postgres://lore:${POSTGRES_PASSWORD}@db:5432/lore
+      LORE_DATA_DIR: /var/lib/lore
+      LORE_LOG_FORMAT: json
+    volumes:
+      - loredata:/var/lib/lore
+    depends_on:
+      db:
+        condition: service_healthy
+    # bash, not sh: /bin/sh is dash in trixie-slim and has no /dev/tcp. The image has no curl.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"ok\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      LORE_DOMAIN: "${LORE_DOMAIN:?}"
+    depends_on:
+      - lore
+    restart: unless-stopped
+
+  backup:
+    image: pgvector/pgvector:pg17
+    environment:
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # $$ keeps compose from interpolating the shell's $. Dumps older than 7 days are deleted.
+    entrypoint: ["bash", "-c", "set -o pipefail; while true; do pg_dump -h db -U lore lore | gzip > /backups/lore-$$(date +%F-%H%M).sql.gz && find /backups -name 'lore-*.sql.gz' -mtime +7 -delete; sleep 86400; done"]
+
+volumes:
+  pgdata:
+  loredata:
+  caddy_data:
+  caddy_config:
