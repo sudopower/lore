@@ -41,9 +41,24 @@ pub fn test_state_with_limit(
     data_dir: &Path,
     max_bundle_bytes: Option<u64>,
 ) -> AppState {
+    build_state(pool, test_config_with_limit(data_dir, max_bundle_bytes))
+}
+
+/// A state whose config is the test config after `change` has edited it.
+pub fn test_state_with(
+    pool: PgPool,
+    data_dir: &Path,
+    change: impl FnOnce(&mut Config),
+) -> AppState {
+    let mut config = test_config(data_dir);
+    change(&mut config);
+    build_state(pool, config)
+}
+
+fn build_state(pool: PgPool, config: Config) -> AppState {
     AppState {
         pool,
-        config: Arc::new(test_config_with_limit(data_dir, max_bundle_bytes)),
+        config: Arc::new(config),
         embedder: Arc::new(HashEmbedder),
         llm: Arc::new(FakeLlm::new()),
         models: Models {

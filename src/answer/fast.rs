@@ -142,6 +142,7 @@ mod tests {
             title: format!("title of {path}"),
             uri: uri.map(str::to_string),
             path: Some(path.to_string()),
+            external_id: None,
             start_line: Some(3),
             end_line: Some(9),
             symbols: Vec::new(),
@@ -193,6 +194,31 @@ mod tests {
                 start_line: Some(3),
                 end_line: Some(9),
                 url: Some("https://example.test/plans".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_session_citation_has_a_title_but_no_path_or_url() {
+        let mut h = hit("unused", None);
+        h.kind = "session".to_string();
+        h.title = "How many plans do we have?".to_string();
+        h.path = None;
+        h.start_line = None;
+        h.end_line = None;
+        h.external_id = Some("sess-1".to_string());
+        let c = parse_citations("See [1].", std::slice::from_ref(&h));
+        assert_eq!(
+            c,
+            vec![Citation {
+                label: "1".to_string(),
+                document_id: Some(h.document_id),
+                kind: Some("session".to_string()),
+                title: Some("How many plans do we have?".to_string()),
+                path: None,
+                start_line: None,
+                end_line: None,
+                url: None,
             }]
         );
     }

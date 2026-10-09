@@ -67,6 +67,7 @@ mod tests {
             title: "Standup notes".to_string(),
             uri: None,
             path: path.map(str::to_string),
+            external_id: None,
             start_line: path.map(|_| 7),
             end_line: path.map(|_| 14),
             symbols: Vec::new(),
@@ -89,6 +90,22 @@ mod tests {
              [1] src/a.rs:7-14 (code)\n```\nfn a() {}\n```\n\n\
              [2] Standup notes (code)\n```\nmeeting notes\n```\n\n\
              Question: what is a?"
+        );
+    }
+
+    #[test]
+    fn a_session_hit_is_listed_by_its_title_and_kind() {
+        let mut h = hit(None, "user: How many plans do we have?");
+        h.kind = "session".to_string();
+        h.title = "How many plans do we have?".to_string();
+        h.start_line = None;
+        h.end_line = None;
+        h.external_id = Some("sess-1".to_string());
+        let (msg, n) = fast_user_message("q", &[h], 60_000);
+        assert_eq!(n, 1);
+        assert!(
+            msg.contains("[1] How many plans do we have? (session)\n```\n"),
+            "{msg}"
         );
     }
 

@@ -91,6 +91,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_OPENAI_MODEL` | unset | Model name sent to the OpenAI-compatible server, used for both answer modes with no effort. Required when `LORE_LLM=openai` |
 | `LORE_OPENAI_API_KEY` | unset | Bearer token for the OpenAI-compatible server. Optional |
 | `LORE_MCP_ALLOWED_HOSTS` | unset | Comma-separated `Host` values the MCP endpoint (`/mcp`) accepts, for example `lore.example.com,lore.lore.svc:8080`. Unset means any host is accepted, which is what you want behind Caddy or a cluster Service; the bearer key is the protection. When set, a request with another `Host` header gets a 403 |
+| `LORE_SESSION_QUIET_SECS` | `60` | Seconds a session must go without a new span before its spans are turned into one searchable document. A session that keeps receiving spans is indexed again after each quiet period. `0` indexes on the next worker run |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |

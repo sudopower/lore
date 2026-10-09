@@ -156,12 +156,46 @@ async fn serve(config: Config) -> Result<()> {
         models,
         source_locks: Default::default(),
     };
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(session_worker(state.clone(), stop_rx));
+    let served = axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = stop_tx.send(true);
+        })
         .await
-        .context("serving")?;
+        .context("serving");
+    // If serving failed, the sender is dropped by now and the worker stops as well.
+    if let Err(e) = worker.await {
+        tracing::error!(error = %e, "session worker task failed");
+    }
+    served?;
     tracing::info!("shut down");
     Ok(())
+}
+
+/// How often the worker looks for sessions that have gone quiet.
+const SESSION_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sessions indexed per poll.
+const SESSION_BATCH: i64 = 20;
+
+/// Turns quiet sessions into documents until `stop` changes. An error is logged and the next
+/// poll tries again.
+async fn session_worker(state: AppState, mut stop: tokio::sync::watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(SESSION_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = tick.tick() => {}
+        }
+        match lore::sessions::process_due_sessions(&state, SESSION_BATCH).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(sessions = n, "sessions processed"),
+            Err(e) => tracing::error!(error = ?e, "session worker failed"),
+        }
+    }
 }
 
 async fn shutdown_signal() {

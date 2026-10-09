@@ -59,6 +59,8 @@ pub struct Hit {
     pub uri: Option<String>,
     /// `documents.metadata->>'path'`: only repo files have one.
     pub path: Option<String>,
+    /// The session id for `session` hits, `None` for every other kind.
+    pub external_id: Option<String>,
     pub start_line: Option<i32>,
     pub end_line: Option<i32>,
     pub symbols: Vec<String>,
@@ -77,6 +79,7 @@ struct HitRow {
     title: String,
     doc_uri: Option<String>,
     path: Option<String>,
+    external_id: Option<String>,
     commit: Option<String>,
     template: Option<String>,
     start_line: Option<i32>,
@@ -109,6 +112,7 @@ impl HitRow {
             title: self.title,
             uri: rendered.or(self.doc_uri),
             path: self.path,
+            external_id: self.external_id,
             start_line: self.start_line,
             end_line: self.end_line,
             symbols: self.symbols,
@@ -171,7 +175,9 @@ pub async fn search(
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let rows: Vec<HitRow> = sqlx::query_as(
         "SELECT c.id, c.document_id, s.name AS source, d.kind, d.title, d.uri AS doc_uri,
-                d.metadata->>'path' AS path, d.metadata->>'commit' AS commit,
+                d.metadata->>'path' AS path,
+                CASE WHEN d.kind = 'session' THEN d.external_id END AS external_id,
+                d.metadata->>'commit' AS commit,
                 s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
