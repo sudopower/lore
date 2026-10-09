@@ -55,7 +55,7 @@ pub struct BundleQuery {
 }
 
 /// 1 to 100 characters of `[A-Za-z0-9._-]`.
-fn valid_repo_name(name: &str) -> bool {
+pub(crate) fn valid_repo_name(name: &str) -> bool {
     (1..=100).contains(&name.len())
         && name
             .bytes()

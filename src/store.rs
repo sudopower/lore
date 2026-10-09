@@ -39,6 +39,10 @@ pub struct NewDocument {
     pub uri: Option<String>,
     pub metadata: serde_json::Value,
     pub content_hash: String,
+    /// The exact text as it was sent, kept only for documents of the documents API: chunks are cut
+    /// and overlap, so they cannot give back the original. Repo files and sessions leave it `None`
+    /// and are rebuilt from their chunks by [`document_text`].
+    pub body: Option<String>,
 }
 
 /// A chunk with the texts that were derived from it: `lexical` feeds the full-text index and
@@ -103,6 +107,24 @@ pub async fn get_source(pool: &PgPool, tenant_id: Uuid, id: Uuid) -> sqlx::Resul
     .await
 }
 
+/// The source `(tenant, kind, name)`, or `None` when the tenant has none.
+pub async fn find_source(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    kind: &str,
+    name: &str,
+) -> sqlx::Result<Option<Source>> {
+    sqlx::query_as(&format!(
+        "SELECT {SOURCE_COLUMNS} FROM sources
+         WHERE tenant_id = $1 AND kind = $2 AND name = $3"
+    ))
+    .bind(tenant_id)
+    .bind(kind)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
 /// The tenant's sources, optionally only those of one source kind.
 pub async fn list_sources(
     pool: &PgPool,
@@ -158,12 +180,15 @@ pub struct DocumentRow {
     pub kind: String,
     pub title: String,
     pub uri: Option<String>,
+    pub metadata: serde_json::Value,
     /// `metadata->>'path'`: only repo files have one.
     pub path: Option<String>,
 }
 
-/// The document and its chunks joined by `\n` in `ord` order, or `None` when the id is unknown or
-/// belongs to another tenant. The text is not capped; callers cut it to their own limit.
+/// The document and its text, or `None` when the id is unknown or belongs to another tenant. The
+/// text is the stored body when the document has one (documents API), otherwise its chunks in
+/// `ord` order, where lines that overlapping chunks share are written once, see [`join_chunks`].
+/// The text is not capped; callers cut it to their own limit.
 ///
 /// A database error is logged and also gives `None`: callers see "not found" rather than a
 /// distinct failure, which keeps the signature simple for the MCP tool and the later reader of
@@ -182,14 +207,22 @@ pub async fn document_text(
     }
 }
 
+/// A document row with its stored body.
+#[derive(sqlx::FromRow)]
+struct StoredDocument {
+    #[sqlx(flatten)]
+    row: DocumentRow,
+    body: Option<String>,
+}
+
 async fn load_document(
     pool: &PgPool,
     tenant_id: Uuid,
     document_id: Uuid,
 ) -> sqlx::Result<Option<(DocumentRow, String)>> {
-    let row: Option<DocumentRow> = sqlx::query_as(
-        "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri,
-                d.metadata->>'path' AS path
+    let found: Option<StoredDocument> = sqlx::query_as(
+        "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri, d.metadata,
+                d.metadata->>'path' AS path, d.body
          FROM documents d
          JOIN sources s ON s.id = d.source_id
          WHERE d.id = $1 AND d.tenant_id = $2",
@@ -198,17 +231,47 @@ async fn load_document(
     .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
-    let Some(row) = row else {
+    let Some(StoredDocument { row, body }) = found else {
         return Ok(None);
     };
-    let chunks: Vec<String> = sqlx::query_scalar(
-        "SELECT text FROM chunks WHERE document_id = $1 AND tenant_id = $2 ORDER BY ord",
+    if let Some(body) = body {
+        return Ok(Some((row, body)));
+    }
+    let chunks: Vec<(String, i32, i32)> = sqlx::query_as(
+        "SELECT text, start_line, end_line FROM chunks
+         WHERE document_id = $1 AND tenant_id = $2 ORDER BY ord",
     )
     .bind(document_id)
     .bind(tenant_id)
     .fetch_all(pool)
     .await?;
-    Ok(Some((row, chunks.join("\n"))))
+    Ok(Some((row, join_chunks(&chunks))))
+}
+
+/// Joins `(text, start_line, end_line)` chunks, given in `ord` order, with `\n`. Window chunks
+/// repeat the last lines of the previous one, so a chunk starting at or before the highest line
+/// already written has its first `written - start + 1` lines dropped (all of it when it ends
+/// there too). Chunks that do not overlap, or leave gaps between them, are joined as they are.
+fn join_chunks(chunks: &[(String, i32, i32)]) -> String {
+    let mut out = String::new();
+    let mut written = 0;
+    for (text, start, end) in chunks {
+        let mut rest = text.as_str();
+        if *start <= written {
+            let skip = (written - *start) as usize + 1;
+            // Every line drops: the whole chunk was already written.
+            let Some(tail) = rest.splitn(skip + 1, '\n').nth(skip) else {
+                continue;
+            };
+            rest = tail;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(rest);
+        written = *end;
+    }
+    out
 }
 
 /// Records the commit a repo source has been indexed up to. `source_id` comes from a `Source` the
@@ -230,8 +293,8 @@ pub async fn upsert_document(
 ) -> Result<Uuid, AppError> {
     let id: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO documents
-           (id, tenant_id, source_id, external_id, kind, title, uri, metadata, content_hash)
-         SELECT $1, s.tenant_id, s.id, $4, $5, $6, $7, $8, $9
+           (id, tenant_id, source_id, external_id, kind, title, uri, metadata, content_hash, body)
+         SELECT $1, s.tenant_id, s.id, $4, $5, $6, $7, $8, $9, $10
          FROM sources s WHERE s.id = $3 AND s.tenant_id = $2
          ON CONFLICT (source_id, external_id) DO UPDATE SET
            kind = EXCLUDED.kind,
@@ -239,6 +302,7 @@ pub async fn upsert_document(
            uri = EXCLUDED.uri,
            metadata = EXCLUDED.metadata,
            content_hash = EXCLUDED.content_hash,
+           body = EXCLUDED.body,
            updated_at = now()
          RETURNING id",
     )
@@ -251,6 +315,7 @@ pub async fn upsert_document(
     .bind(&doc.uri)
     .bind(&doc.metadata)
     .bind(&doc.content_hash)
+    .bind(&doc.body)
     .fetch_optional(&mut **tx)
     .await?;
     id.ok_or(AppError::NotFound)
@@ -470,4 +535,44 @@ pub async fn upsert_spans(
         q.build().execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_chunks;
+
+    fn chunk(start: i32, end: i32) -> (String, i32, i32) {
+        let text = (start..=end)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, start, end)
+    }
+
+    #[test]
+    fn chunks_are_joined_without_repeating_lines() {
+        assert_eq!(join_chunks(&[]), "");
+        // Overlap by one line, no overlap, and a gap.
+        assert_eq!(
+            join_chunks(&[chunk(1, 3), chunk(3, 5), chunk(6, 7), chunk(9, 9)]),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl9"
+        );
+    }
+
+    #[test]
+    fn a_chunk_inside_what_is_written_adds_nothing() {
+        assert_eq!(
+            join_chunks(&[chunk(1, 6), chunk(2, 4)]),
+            "l1\nl2\nl3\nl4\nl5\nl6"
+        );
+    }
+
+    #[test]
+    fn a_skipped_chunk_does_not_move_the_written_line_back() {
+        // The second chunk is inside the first and adds nothing, so the third still overlaps the first.
+        assert_eq!(
+            join_chunks(&[chunk(1, 10), chunk(5, 6), chunk(8, 12)]),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12"
+        );
+    }
 }

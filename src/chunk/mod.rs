@@ -1,6 +1,10 @@
 //! Splits file content into searchable chunks: code items via tree-sitter, markdown sections,
 //! and plain line windows. Everything here is pure (no I/O, no database) and total: any input,
 //! however malformed, yields chunks rather than a panic, so request handlers can call it directly.
+//!
+//! Repo files go through [`chunk_file`], which cuts what does not fit a chunk. The documents API
+//! uses [`chunk_markdown_split`] instead, which splits rather than cuts so that all of the text
+//! stays searchable, and stops as soon as a chunk limit is passed.
 
 mod code;
 mod lines;
@@ -8,9 +12,10 @@ mod markdown;
 
 use std::path::Path;
 
-pub use markdown::chunk_markdown;
+pub use markdown::{chunk_markdown, chunk_markdown_split};
 
 /// Chunks are cut to this many characters (not bytes) so one huge line cannot blow up a row.
+/// [`chunk_markdown_split`] sizes its chunks to fit, so the cut never loses text there.
 const MAX_CHUNK_CHARS: usize = 8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

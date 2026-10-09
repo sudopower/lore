@@ -352,6 +352,7 @@ mod tests {
             kind: "code".to_string(),
             title: "plans.rs".to_string(),
             uri: uri.map(str::to_string),
+            metadata: serde_json::json!({}),
             path: path.map(str::to_string),
         }
     }

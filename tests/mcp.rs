@@ -167,6 +167,38 @@ async fn search_finds_the_plans_file_and_get_document_reads_it(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn get_document_returns_a_note_exactly_as_it_was_sent(pool: PgPool) {
+    let (url, key, router) = start(pool).await;
+    // CRLF, blank lines and a trailing newline are lost when chunks are joined.
+    let sent = "first\r\n\r\n\r\nsecond line\n\n";
+    let body = json!({
+        "source": "notes",
+        "documents": [{ "external_id": "n1", "title": "Exact", "text": sent }]
+    });
+    let (status, reply) = common::send(
+        &router,
+        "POST",
+        "/v1/documents",
+        &key,
+        body.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{reply}");
+
+    let client = connect(&url, &key).await;
+    let hits = json_items(&call(&client, "search", json!({ "query": "second line" })).await);
+    let id = hits.iter().find(|h| h["title"] == "Exact").unwrap()["document_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = call(&client, "get_document", json!({ "document_id": id })).await;
+    assert!(!is_error(&res), "{:?}", texts(&res));
+    let doc = &texts(&res)[0];
+    assert!(doc.ends_with(&format!("\n\n{sent}")), "{doc:?}");
+    client.cancel().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn search_clamps_k_and_filters_by_kind(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;

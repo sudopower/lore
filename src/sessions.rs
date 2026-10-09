@@ -542,6 +542,7 @@ async fn process_session(
                 uri: None,
                 metadata: doc.metadata,
                 content_hash: hash,
+                body: None,
             };
             store::index_text(state, tenant_id, &source, new_doc, chunks, &doc.title).await?;
             indexed = true;

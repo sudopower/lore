@@ -126,7 +126,11 @@ stage_m4() {
     || fail "ask failed"
   assert_jq "$A" '[.citations[].kind] | index("session") != null' "the answer should cite a session"
 
-  # (d) documents: added in T14
+  LORE_KEY=$K lore doc put --source smoke-notes --id n1 --title "Smoke note" \
+    --text "The quarterly zorblax review moved to Thursdays." >/dev/null || fail "doc put failed"
+  S=$(LORE_KEY=$K lore search "zorblax" --json) || fail "search for the note failed"
+  assert_jq "$S" '.hits[0].kind == "note"' "the note should be the first hit for zorblax"
+
   echo "SMOKE M4 OK"
 }
 

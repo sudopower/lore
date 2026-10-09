@@ -96,6 +96,7 @@ async fn add_doc(
         uri: uri.map(str::to_string),
         metadata: json!({}),
         content_hash: format!("hash-{external_id}"),
+        body: None,
     };
     index_text(state, tenant_id, &source, doc, chunks, title)
         .await
@@ -587,6 +588,7 @@ async fn without_a_rendered_url_the_document_uri_is_used(pool: PgPool) {
         uri: uri.map(str::to_string),
         metadata: json!({}),
         content_hash: external_id.to_string(),
+        body: None,
     };
     for (id, uri, text) in [
         ("a", Some("https://wiki.example.com/a"), "alpaca fleece"),
