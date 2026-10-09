@@ -72,6 +72,7 @@ fn build_state(pool: PgPool, config: Config) -> AppState {
             },
         },
         source_locks: Arc::default(),
+        deep_guard: Arc::default(),
     }
 }
 

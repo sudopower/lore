@@ -331,7 +331,7 @@ async fn ask_returns_the_answer_with_sources_then_the_json(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn ask_deep_is_a_tool_error_until_it_exists(pool: PgPool) {
+async fn ask_deep_runs_the_agent_loop_and_a_blank_question_is_an_error(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
@@ -341,8 +341,15 @@ async fn ask_deep_is_a_tool_error_until_it_exists(pool: PgPool) {
         json!({ "question": "list every plan and its seat limit", "mode": "deep" }),
     )
     .await;
-    assert!(is_error(&res));
-    assert_eq!(texts(&res), ["deep mode is not available yet"]);
+    assert!(!is_error(&res), "{:?}", texts(&res));
+    let texts = texts(&res);
+    assert_eq!(texts.len(), 2);
+    let full: Value = serde_json::from_str(&texts[1]).expect("the second item is JSON");
+    assert_eq!(full["mode"], "deep");
+    assert!(full["tool_calls"].as_u64().unwrap() >= 1, "{full}");
+    let citations = full["citations"].as_array().unwrap();
+    assert!(citations.iter().any(|c| c["path"] == PLANS), "{full}");
+    assert!(texts[0].contains(PLANS), "{}", texts[0]);
 
     let blank = call(&client, "ask", json!({ "question": " " })).await;
     assert!(is_error(&blank));

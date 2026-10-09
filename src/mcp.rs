@@ -112,7 +112,7 @@ pub enum AskMode {
 pub struct AskArgs {
     /// The question, in plain language.
     question: String,
-    /// `fast` (default) answers from the best passages. `deep` is not available yet.
+    /// `fast` (default) answers from the best passages. `deep` lets the model search, grep and read files for a few seconds; it needs a tool-capable provider.
     mode: Option<AskMode>,
 }
 

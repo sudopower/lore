@@ -39,6 +39,14 @@ pub struct Config {
     /// `LORE_SESSION_QUIET_SECS`: how long a session must have no new spans before it is
     /// turned into a searchable document. 0 means as soon as the worker runs.
     pub session_quiet_secs: u64,
+    /// `LORE_DEEP_BUDGET_SECS`: the time budget of one deep-mode question, in seconds.
+    pub deep_budget_secs: u64,
+    /// `LORE_DEEP_MAX_ROUNDS`: the most tool rounds a deep-mode question may use.
+    pub deep_max_rounds: u32,
+    /// `LORE_DEEP_CONCURRENCY`: how many deep-mode questions one tenant may run at once.
+    pub deep_concurrency: usize,
+    /// `LORE_DEEP_DAILY_LIMIT`: how many deep-mode questions one tenant may ask per UTC day.
+    pub deep_daily_limit: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +82,33 @@ pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default `LORE_SESSION_QUIET_SECS`.
 pub const DEFAULT_SESSION_QUIET_SECS: u64 = 60;
+
+/// Default `LORE_DEEP_BUDGET_SECS`.
+pub const DEFAULT_DEEP_BUDGET_SECS: u64 = 30;
+
+/// Default `LORE_DEEP_MAX_ROUNDS`.
+pub const DEFAULT_DEEP_MAX_ROUNDS: u32 = 12;
+
+/// Default `LORE_DEEP_CONCURRENCY`.
+pub const DEFAULT_DEEP_CONCURRENCY: usize = 2;
+
+/// Default `LORE_DEEP_DAILY_LIMIT`.
+pub const DEFAULT_DEEP_DAILY_LIMIT: u32 = 100;
+
+/// Reads a positive integer variable, or `default` when it is unset.
+fn positive<T: std::str::FromStr + PartialOrd + Default>(
+    f: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    default: T,
+) -> Result<T> {
+    match f(key) {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<T>() {
+            Ok(n) if n > T::default() => Ok(n),
+            _ => bail!("{key} must be a positive integer, got {v:?}"),
+        },
+    }
+}
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -118,6 +153,11 @@ impl Config {
                 }
             },
         };
+
+        let deep_budget_secs = positive(&f, "LORE_DEEP_BUDGET_SECS", DEFAULT_DEEP_BUDGET_SECS)?;
+        let deep_max_rounds = positive(&f, "LORE_DEEP_MAX_ROUNDS", DEFAULT_DEEP_MAX_ROUNDS)?;
+        let deep_concurrency = positive(&f, "LORE_DEEP_CONCURRENCY", DEFAULT_DEEP_CONCURRENCY)?;
+        let deep_daily_limit = positive(&f, "LORE_DEEP_DAILY_LIMIT", DEFAULT_DEEP_DAILY_LIMIT)?;
 
         let llm = match get("LORE_LLM", "anthropic").as_str() {
             "anthropic" => LlmKind::Anthropic,
@@ -164,6 +204,10 @@ impl Config {
             openai_api_key: non_empty("LORE_OPENAI_API_KEY"),
             mcp_allowed_hosts: parse_hosts(f("LORE_MCP_ALLOWED_HOSTS").as_deref()),
             session_quiet_secs,
+            deep_budget_secs,
+            deep_max_rounds,
+            deep_concurrency,
+            deep_daily_limit,
         })
     }
 }
@@ -219,6 +263,40 @@ mod tests {
         assert_eq!(c.openai_api_key, None);
         assert_eq!(c.mcp_allowed_hosts, None);
         assert_eq!(c.session_quiet_secs, 60);
+        assert_eq!(c.deep_budget_secs, 30);
+        assert_eq!(c.deep_max_rounds, 12);
+        assert_eq!(c.deep_concurrency, 2);
+        assert_eq!(c.deep_daily_limit, 100);
+    }
+
+    #[test]
+    fn deep_limits_are_read() {
+        let c = lookup(&[
+            ("LORE_DEEP_BUDGET_SECS", " 45 "),
+            ("LORE_DEEP_MAX_ROUNDS", "3"),
+            ("LORE_DEEP_CONCURRENCY", "4"),
+            ("LORE_DEEP_DAILY_LIMIT", "7"),
+        ])
+        .unwrap();
+        assert_eq!(c.deep_budget_secs, 45);
+        assert_eq!(c.deep_max_rounds, 3);
+        assert_eq!(c.deep_concurrency, 4);
+        assert_eq!(c.deep_daily_limit, 7);
+    }
+
+    #[test]
+    fn bad_deep_limits_are_an_error() {
+        for key in [
+            "LORE_DEEP_BUDGET_SECS",
+            "LORE_DEEP_MAX_ROUNDS",
+            "LORE_DEEP_CONCURRENCY",
+            "LORE_DEEP_DAILY_LIMIT",
+        ] {
+            for bad in ["", "0", "-1", "lots", "1.5"] {
+                let err = lookup(&[(key, bad)]).unwrap_err();
+                assert!(err.to_string().contains(key), "{err}");
+            }
+        }
     }
 
     #[test]

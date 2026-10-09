@@ -3,7 +3,7 @@
 Ask questions of your agents' traces, your coding sessions and your codebases, and get answers with citations.
 
 - **fast** mode: one retrieval and one model call, an answer in seconds (for standups and meetings).
-- **deep** mode: an agent loop with `search`, `grep` and `read_file` tools, under a time budget.
+- **deep** mode: an agent loop with `search`, `grep`, `read_file` and `get_session` tools, under a time budget.
 
 Inputs: OpenTelemetry GenAI traces over OTLP/HTTP, git repositories, and a plain documents API.
 Surfaces: a `lore` CLI, an MCP server, and a small built-in web page.
@@ -60,10 +60,11 @@ cargo build --release && export PATH="$PWD/target/release:$PATH"
 curl -s $LORE_URL/healthz            # {"status":"ok","db":"ok"}
 scripts/smoke.sh m1                  # last line: SMOKE M1 OK
 scripts/smoke.sh m2                  # last line: SMOKE M2 OK
+scripts/smoke.sh m5                  # last line: SMOKE M5 OK (deep mode, with LORE_LLM=fake)
 scripts/mcp_smoke.sh                 # last line: MCP SMOKE OK
 ```
 
-`scripts/smoke.sh <stage>` (`m1`, `m2`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`. `scripts/mcp_smoke.sh` checks the MCP endpoint (see [Use lore from agents](#use-lore-from-agents)); it needs `curl` as well.
+`scripts/smoke.sh <stage>` (`m1`, `m2`, `m4`, `m5`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq`, `git` and `curl` on the path. It creates fresh tenants on each run. It also works against `make run`. `scripts/mcp_smoke.sh` checks the MCP endpoint (see [Use lore from agents](#use-lore-from-agents)); it needs `curl` as well.
 
 ## Configuration
 
@@ -92,6 +93,10 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_OPENAI_API_KEY` | unset | Bearer token for the OpenAI-compatible server. Optional |
 | `LORE_MCP_ALLOWED_HOSTS` | unset | Comma-separated `Host` values the MCP endpoint (`/mcp`) accepts, for example `lore.example.com,lore.lore.svc:8080`. Unset means any host is accepted, which is what you want behind Caddy or a cluster Service; the bearer key is the protection. When set, a request with another `Host` header gets a 403 |
 | `LORE_SESSION_QUIET_SECS` | `60` | Seconds a session must go without a new span before its spans are turned into one searchable document. A session that keeps receiving spans is indexed again after each quiet period. `0` indexes on the next worker run |
+| `LORE_DEEP_BUDGET_SECS` | `30` | Time budget of one deep-mode question, in seconds. Once more than 80% of it has passed, the model is told to answer with what it has. Must be a positive integer |
+| `LORE_DEEP_MAX_ROUNDS` | `12` | Most tool rounds of one deep-mode question. After that the model is told to answer with what it has. Must be a positive integer |
+| `LORE_DEEP_CONCURRENCY` | `2` | How many deep-mode questions one tenant may run at once. A further question waits up to 5 seconds for a free slot, then gets a 429. Must be a positive integer |
+| `LORE_DEEP_DAILY_LIMIT` | `100` | How many deep-mode questions one tenant may ask per UTC day. The next one gets a 429 ("daily deep-mode limit reached"). The count is kept in memory, so a restart resets it. Must be a positive integer |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
@@ -250,22 +255,26 @@ lore ask "how many plans are there?" --json                        # the server'
 | Field | Meaning |
 |---|---|
 | `question` | Required. A missing or blank question is a 400. At most 2000 characters, otherwise a 400 |
-| `mode` | `fast` (the default) or `deep`. `deep` is a 400 ("deep mode is not available yet") until it exists |
-| `k` | How many sources to retrieve, default 12, clamped to 1 to 50 |
-| `kind` | A list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
-| `source` | Only the source with this name |
+| `mode` | `fast` (the default) or `deep`. `deep` runs an agent loop (see below) and is a 400 ("deep mode needs a tool-capable model provider (LORE_LLM=anthropic)") with `LORE_LLM=openai` |
+| `k` | Fast mode only: how many sources to retrieve, default 12, clamped to 1 to 50 |
+| `kind` | Fast mode only: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
+| `source` | Fast mode only: only the source with this name |
 
 The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens` and `output_tokens`.
 
 When nothing indexed matches, the answer is "I found nothing indexed that matches this question.", `model` is `"none"` and the model is not called. If the model declines to answer, the response is a 422 `{"error": "the model declined to answer"}`.
+
+Deep mode (`"mode": "deep"`) lets the model drive the `search`, `grep`, `read_file` and `get_session` tools for up to `LORE_DEEP_MAX_ROUNDS` rounds within `LORE_DEEP_BUDGET_SECS` seconds. Tool calls of one round run at the same time, each for at most 10 seconds; a slower one gives the model an error result. Past 80% of the budget, or at the round cap, the model gets one last call with the tools turned off and is told to answer. Cost is capped per tenant by `LORE_DEEP_CONCURRENCY` and `LORE_DEEP_DAILY_LIMIT` (both give a 429). A deep answer cites code as `[path:start-end]`, with the path as the tools print it minus the source name, and sessions as `[session:<id>]`. Each distinct citation appears once in `citations` (at most 50), in order of first appearance. The `label` is the text between the brackets. A citation whose path or session lives in the tenant's index carries `document_id`, `kind`, `title` and `url`; one that does not match keeps its `label`, `path` and lines, with `document_id` null. In deep mode `tool_calls` counts the tool calls, `sources_considered` is 0, `usage` is summed over all model calls and `model` is the model of the last call. If the budget runs out with no answer at all, the response is a 500.
 
 The CLI prints the answer, a blank line, a `Sources:` list with `[label] path:start-end` (the title when there is no path) and the link on the next line, then a dim line `<model> · <latency> ms · <input> in / <output> out`. With `LORE_LLM=fake` the answer is `Fake answer from N sources.` followed by `[1] [2]` and so on: it exercises the plumbing without a model.
 
 `GET /v1/info` needs no key. It reports what the server runs, for clients and health dashboards:
 
 ```bash
-curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"hash","modes":["fast"]}
+curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"hash","modes":["fast","deep"]}
 ```
+
+`modes` lists `deep` only when the model provider can use tools (`anthropic` and `fake`, not `openai`).
 
 ## Web page
 
@@ -292,7 +301,7 @@ Any other MCP client that speaks streamable HTTP works the same way.
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`) | One text item: a JSON array of hits with `document_id`, `path`, `start_line`, `end_line`, `kind`, `title`, `source`, `score` and `snippet` (the first 40 lines) |
-| `ask` | `question`, `mode` (`fast`, the default; `deep` is a tool error until deep mode exists) | Two text items: the answer followed by a `Sources:` list with one line per citation, then the full `/v1/ask` response as JSON |
+| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop) | Two text items: the answer followed by a `Sources:` list with one line per citation, then the full `/v1/ask` response as JSON |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
 
