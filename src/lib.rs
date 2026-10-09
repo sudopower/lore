@@ -11,3 +11,4 @@ pub mod llm;
 pub mod repo;
 pub mod search;
 pub mod store;
+pub mod web;

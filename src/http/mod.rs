@@ -16,6 +16,7 @@ use crate::embed::Embedder;
 use crate::error::AppError;
 use crate::llm::{Llm, Models};
 use crate::repo::SourceLocks;
+use crate::web;
 
 pub mod admin;
 pub mod ask;
@@ -40,6 +41,7 @@ pub fn router(state: AppState) -> Router {
     // The limit is on the bundle route only: other routes keep axum's own defaults.
     let bundle_limit = usize::try_from(state.config.max_bundle_bytes).unwrap_or(usize::MAX);
     Router::new()
+        .route("/", get(web::index))
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
         .route("/v1/me", get(me::me))

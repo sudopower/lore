@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lore</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbf9;
+    --fg: #1d1d1b;
+    --muted: #6b6b66;
+    --border: #d9d9d2;
+    --panel: #ffffff;
+    --accent: #1f5fbf;
+    --code-bg: #eeeee8;
+    --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618;
+      --fg: #e8e8e4;
+      --muted: #9a9a94;
+      --border: #38383c;
+      --panel: #1f1f22;
+      --accent: #7fb0ff;
+      --code-bg: #2a2a2e;
+      --error: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+  }
+  header h1 { margin: 0; font-size: 28px; letter-spacing: 0.02em; }
+  header p { margin: 4px 0 24px; color: var(--muted); }
+  label.field { display: block; margin-bottom: 4px; font-size: 14px; color: var(--muted); }
+  input[type="password"], textarea {
+    width: 100%;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  textarea { min-height: 96px; resize: vertical; }
+  input:focus-visible, textarea:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .row { margin-bottom: 16px; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
+  fieldset { margin: 0; padding: 0; border: 0; display: flex; gap: 16px; }
+  fieldset label { cursor: pointer; }
+  fieldset label.off { color: var(--muted); cursor: not-allowed; }
+  button {
+    padding: 10px 20px;
+    font: inherit;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--accent);
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: wait; }
+  #status { min-height: 1.5em; margin: 16px 0 0; color: var(--muted); }
+  #status.error { color: var(--error); }
+  #answer { margin-top: 8px; font-size: 18px; overflow-wrap: anywhere; }
+  #answer p { margin: 0 0 14px; }
+  #answer ul { margin: 0 0 14px; padding-left: 24px; }
+  code {
+    padding: 1px 5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--code-bg);
+    border-radius: 4px;
+  }
+  a { color: var(--accent); }
+  #citations-box { margin-top: 24px; }
+  #citations-box h2 { margin: 0 0 8px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  #citations { margin: 0; padding-left: 0; list-style: none; }
+  #citations li {
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    overflow-wrap: anywhere;
+  }
+  #citations li:target { border-color: var(--accent); }
+  .kind { display: block; font-size: 12px; color: var(--muted); }
+  #footer { margin-top: 16px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>lore</h1>
+    <p>Ask your code, docs and agent sessions</p>
+  </header>
+
+  <form id="ask-form" autocomplete="off">
+    <div class="row">
+      <label class="field" for="key">API key</label>
+      <input type="password" id="key" name="key" placeholder="lk_..." autocomplete="off" spellcheck="false">
+    </div>
+    <div class="row">
+      <label class="field" for="question">Question</label>
+      <textarea id="question" name="question" placeholder="How many plans are there?"></textarea>
+    </div>
+    <div class="actions">
+      <fieldset>
+        <legend hidden>Mode</legend>
+        <label><input type="radio" name="mode" value="fast" checked> fast</label>
+        <label id="deep-label"><input type="radio" name="mode" value="deep" id="mode-deep" disabled title="Deep mode is not enabled on this server"> deep</label>
+      </fieldset>
+      <button type="submit" id="submit">Ask</button>
+    </div>
+  </form>
+
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="answer"></div>
+  <div id="citations-box" hidden>
+    <h2>Sources</h2>
+    <ol id="citations"></ol>
+  </div>
+  <p id="footer"></p>
+</main>
+
+<!-- Pure functions: no DOM access, so tests can run this block on its own. -->
+<script id="lore-pure">
+var KEY_NAME = 'lore.key';
+
+// Storage can throw (blocked cookies, private mode), so every access is guarded.
+function loadKey() {
+  try {
+    return localStorage.getItem(KEY_NAME) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function saveKey(value) {
+  try {
+    if (value) {
+      localStorage.setItem(KEY_NAME, value);
+    } else {
+      localStorage.removeItem(KEY_NAME);
+    }
+  } catch (e) {
+    // Storage is unavailable: the key just lasts for this page view.
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Only http and https links are followed. Anything else (javascript:, data:, ...) is plain text.
+function safeUrl(u) {
+  if (typeof u !== 'string') return null;
+  return /^https?:\/\//i.test(u) ? u : null;
+}
+
+// Inline markup for one line of already escaped text: `code`, and [label] links to citations.
+function renderInline(escaped, labels) {
+  return escaped
+    .split(/(`[^`\n]+`)/)
+    .map(function (part) {
+      if (part.length > 2 && part.charAt(0) === '`' && part.charAt(part.length - 1) === '`') {
+        return '<code>' + part.slice(1, -1) + '</code>';
+      }
+      return part.replace(/\[([^\[\]\n]+)\]/g, function (whole, label) {
+        return labels.has(label)
+          ? '<a href="#cite-' + labels.get(label) + '">[' + label + ']</a>'
+          : whole;
+      });
+    })
+    .join('');
+}
+
+// Answer text to HTML. The text is escaped first, so server text never becomes markup.
+function renderAnswer(text, citations) {
+  var labels = new Map();
+  (Array.isArray(citations) ? citations : []).forEach(function (c, i) {
+    if (c && typeof c.label === 'string' && !labels.has(escapeHtml(c.label))) {
+      labels.set(escapeHtml(c.label), i);
+    }
+  });
+  var escaped = escapeHtml(String(text).replace(/\r\n?/g, '\n'));
+  var out = [];
+  escaped.split(/\n[ \t]*\n/).forEach(function (block) {
+    var para = [];
+    var items = [];
+    function flushPara() {
+      if (para.length) out.push('<p>' + para.join('<br>') + '</p>');
+      para = [];
+    }
+    function flushList() {
+      if (items.length) out.push('<ul>' + items.join('') + '</ul>');
+      items = [];
+    }
+    block.split('\n').forEach(function (line) {
+      var m = /^\s*[-*] (.*)$/.exec(line);
+      if (m) {
+        flushPara();
+        items.push('<li>' + renderInline(m[1], labels) + '</li>');
+      } else if (line.trim() !== '') {
+        flushList();
+        para.push(renderInline(line.trim(), labels));
+      }
+    });
+    flushPara();
+    flushList();
+  });
+  return out.join('');
+}
+
+// What to show for one citation: its text, a link only when the url is safe, and its kind.
+function citationView(c) {
+  var place = '';
+  if (c.path) {
+    place = c.path;
+    if (typeof c.start_line === 'number' && typeof c.end_line === 'number') {
+      place += ':' + c.start_line + '-' + c.end_line;
+    }
+  } else {
+    place = c.title || c.url || c.kind || 'source';
+  }
+  return {
+    text: '[' + c.label + '] ' + place,
+    href: safeUrl(c.url),
+    kind: c.kind || ''
+  };
+}
+
+function footerText(res) {
+  var usage = res.usage || {};
+  return res.model + ' · ' + res.latency_ms + ' ms · ' +
+    usage.input_tokens + ' in / ' + usage.output_tokens + ' out';
+}
+
+// The message for a failed request: the server's own `error`, or something sensible
+// when the body is not JSON.
+function errorMessage(status, bodyText) {
+  if (status === 401) return 'Invalid or missing key';
+  var parsed = null;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch (e) {
+    parsed = null;
+  }
+  if (parsed && typeof parsed.error === 'string' && parsed.error) return parsed.error;
+  var snippet = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return 'Request failed (HTTP ' + status + ')' + (snippet ? ': ' + snippet : '');
+}
+
+function deepAvailable(info) {
+  return !!info && Array.isArray(info.modes) && info.modes.indexOf('deep') !== -1;
+}
+
+// Enter submits, Shift+Enter is a new line, and Enter while an IME is composing is left alone.
+function shouldSubmit(e) {
+  return e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229;
+}
+</script>
+
+<script>
+(function () {
+  var form = document.getElementById('ask-form');
+  var keyInput = document.getElementById('key');
+  var question = document.getElementById('question');
+  var deep = document.getElementById('mode-deep');
+  var deepLabel = document.getElementById('deep-label');
+  var button = document.getElementById('submit');
+  var statusEl = document.getElementById('status');
+  var answerEl = document.getElementById('answer');
+  var citesBox = document.getElementById('citations-box');
+  var citesEl = document.getElementById('citations');
+  var footerEl = document.getElementById('footer');
+  var timer = null;
+
+  keyInput.value = loadKey();
+  keyInput.addEventListener('input', function () { saveKey(keyInput.value.trim()); });
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+  }
+
+  function setDeep(on) {
+    deep.disabled = !on;
+    deep.title = on ? '' : 'Deep mode is not enabled on this server';
+    deepLabel.className = on ? '' : 'off';
+    if (!on && deep.checked) document.querySelector('input[name="mode"][value="fast"]').checked = true;
+  }
+
+  // Deep stays disabled until the server says it is on, and when /v1/info cannot be read.
+  setDeep(false);
+  fetch('/v1/info')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (info) { setDeep(deepAvailable(info)); })
+    .catch(function () { setDeep(false); });
+
+  function clearResult() {
+    answerEl.innerHTML = '';
+    citesEl.innerHTML = '';
+    citesBox.hidden = true;
+    footerEl.textContent = '';
+  }
+
+  function showResult(res) {
+    var cites = Array.isArray(res.citations) ? res.citations : [];
+    answerEl.innerHTML = renderAnswer(res.answer, cites);
+    cites.forEach(function (c, i) {
+      var view = citationView(c);
+      var li = document.createElement('li');
+      li.id = 'cite-' + i;
+      if (view.href) {
+        var a = document.createElement('a');
+        a.href = view.href;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = view.text;
+        li.appendChild(a);
+      } else {
+        li.appendChild(document.createTextNode(view.text));
+      }
+      var kind = document.createElement('span');
+      kind.className = 'kind';
+      kind.textContent = view.kind;
+      li.appendChild(kind);
+      citesEl.appendChild(li);
+    });
+    citesBox.hidden = cites.length === 0;
+    footerEl.textContent = footerText(res);
+  }
+
+  function stopTimer() {
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  function ask() {
+    var q = question.value.trim();
+    var key = keyInput.value.trim();
+    if (!q) return;
+    if (!key) {
+      setStatus('Paste an API key first', true);
+      return;
+    }
+    var mode = document.querySelector('input[name="mode"]:checked').value;
+    clearResult();
+    button.disabled = true;
+    var started = Date.now();
+    function tick() {
+      setStatus('Thinking… ' + Math.floor((Date.now() - started) / 1000) + 's', false);
+    }
+    tick();
+    stopTimer();
+    timer = setInterval(tick, 1000);
+
+    function done() {
+      stopTimer();
+      button.disabled = false;
+    }
+
+    fetch('/v1/ask', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q, mode: mode })
+    })
+      .then(function (r) {
+        return r.text().then(function (body) { return { status: r.status, ok: r.ok, body: body }; });
+      })
+      .then(function (r) {
+        done();
+        if (!r.ok) {
+          setStatus(errorMessage(r.status, r.body), true);
+          return;
+        }
+        var res = null;
+        try { res = JSON.parse(r.body); } catch (e) { res = null; }
+        if (!res || typeof res.answer !== 'string') {
+          setStatus('The server sent a reply this page cannot read', true);
+          return;
+        }
+        setStatus('', false);
+        showResult(res);
+      })
+      .catch(function (e) {
+        done();
+        setStatus('Could not reach the server: ' + (e && e.message ? e.message : e), true);
+      });
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    ask();
+  });
+  question.addEventListener('keydown', function (e) {
+    if (shouldSubmit(e)) {
+      e.preventDefault();
+      if (!button.disabled) ask();
+    }
+  });
+})();
+</script>
+</body>
+</html>
