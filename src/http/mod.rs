@@ -22,6 +22,7 @@ use crate::web;
 
 pub mod admin;
 pub mod ask;
+pub mod documents;
 pub mod info;
 pub mod me;
 pub mod repos;
@@ -70,6 +71,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/traces",
             post(traces::post_traces).layer(RequestBodyLimitLayer::new(16 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/documents",
+            post(documents::post_documents)
+                .layer(RequestBodyLimitLayer::new(documents::BODY_LIMIT)),
+        )
+        .route("/v1/documents/{id}", get(documents::get_document))
+        .route(
+            "/v1/documents/{source}/{*external_id}",
+            delete(documents::delete_document),
         )
         .route("/v1/search", get(search::get_search))
         .route("/v1/ask", post(ask::post_ask))

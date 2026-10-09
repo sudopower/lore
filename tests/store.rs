@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use common::{create_tenant_key, test_router, test_state};
-use lore::chunk::{Chunk, ChunkKind, embed_text};
+use lore::chunk::{Chunk, ChunkKind, chunk_file, chunk_markdown, embed_text};
 use lore::embed::{DIM, Embedder, HashEmbedder};
 use lore::error::AppError;
 use lore::http::AppState;
@@ -850,6 +850,69 @@ async fn document_text_joins_the_chunks_in_order_for_the_owning_tenant_only(pool
 
     assert!(document_text(&pool, b, id).await.is_none(), "other tenant");
     assert!(document_text(&pool, a, Uuid::new_v4()).await.is_none());
+}
+
+/// Stores `chunks` as one document and reads its text back.
+async fn stored_text(pool: &PgPool, chunks: Vec<Chunk>) -> String {
+    let state = state(pool);
+    let t = tenant(&state, "acme").await;
+    let src = ensure_source(pool, t, "repo", "app", None).await.unwrap();
+    index_text(
+        &state,
+        t,
+        &src,
+        doc(&src, "long.txt", "h1"),
+        chunks,
+        "long.txt",
+    )
+    .await
+    .unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM documents")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    document_text(pool, t, id).await.expect("owner reads it").1
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn document_text_does_not_repeat_the_lines_chunks_overlap_by(pool: PgPool) {
+    // 150 lines make three overlapping windows of the line chunker.
+    let original: String = (1..=150)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunks = chunk_file("notes.txt", &original);
+    assert!(chunks.len() > 2, "{} chunks", chunks.len());
+    assert!(chunks[1].start_line <= chunks[0].end_line, "no overlap");
+    assert_eq!(stored_text(&pool, chunks).await, original);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn document_text_of_overlapping_markdown_windows_is_the_original(pool: PgPool) {
+    let original = format!(
+        "# Plan\n{}",
+        (1..=300)
+            .map(|n| format!("item {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let chunks = chunk_markdown(&original, "plan");
+    assert!(chunks.len() > 2, "{} chunks", chunks.len());
+    assert!(chunks[1].start_line <= chunks[0].end_line, "no overlap");
+    assert_eq!(stored_text(&pool, chunks).await, original);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn document_text_of_overlapping_code_windows_is_the_original(pool: PgPool) {
+    // One function longer than the item limit is split into overlapping pieces.
+    let body: String = (1..=300)
+        .map(|n| format!("    let v{n} = {n};\n"))
+        .collect();
+    let original = format!("fn big() {{\n{body}}}");
+    let chunks = chunk_file("big.rs", &original);
+    assert!(chunks.len() > 2, "{} chunks", chunks.len());
+    assert!(chunks[1].start_line <= chunks[0].end_line, "no overlap");
+    assert_eq!(stored_text(&pool, chunks).await, original);
 }
 
 #[sqlx::test(migrations = "./migrations")]

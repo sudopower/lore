@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lore::cli::{AdminCommand, AskArgs, Client, OtlpCommand, RepoCommand, SearchArgs};
+use lore::cli::{AdminCommand, AskArgs, Client, DocCommand, OtlpCommand, RepoCommand, SearchArgs};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -54,6 +54,11 @@ enum Command {
         #[command(subcommand)]
         command: OtlpCommand,
     },
+    /// Write, delete and read notes and documents (needs an API key)
+    Doc {
+        #[command(subcommand)]
+        command: DocCommand,
+    },
     /// Search the tenant's indexed code, docs, sessions and notes (needs an API key)
     Search(SearchArgs),
     /// Ask a question and get an answer with citations (needs an API key)
@@ -92,6 +97,10 @@ async fn main() -> Result<()> {
         Command::Otlp { command } => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
             lore::cli::run_otlp(&client, command).await
+        }
+        Command::Doc { command } => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_doc(&client, command).await
         }
         Command::Search(args) => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;

@@ -209,6 +209,32 @@ lore otlp send tests/fixtures/otlp/otel_genai_session.json --protobuf --gzip
 
 `lore otlp send <FILE.json>` posts an OTLP JSON file to `/v1/traces` with the global `--url` and `--key`. `--protobuf` converts it to protobuf first, and `--gzip` compresses the body. It prints `HTTP <status>` and exits non-zero when the server does not answer 2xx.
 
+## Documents
+
+`POST /v1/documents` stores notes and documents that are not in a repo or a trace, and indexes them so search and ask find them. It needs an `ingest` key.
+
+```bash
+curl -X POST "$LORE_URL/v1/documents" \
+  -H "Authorization: Bearer $LORE_KEY" -H "Content-Type: application/json" \
+  -d '{"source": "notes", "documents": [
+        {"external_id": "n1", "title": "Review", "text": "The quarterly zorblax review moved to Thursdays."}
+      ]}'
+# {"upserted":1,"unchanged":0,"chunks":1}
+```
+
+`source` names a group of documents (1 to 100 characters of `A-Z a-z 0-9 . _ -`; it is created on first use). `documents` has 1 to 100 entries. Each has an `external_id` (1 to 512 bytes, unique within the source), a `title`, a `text` of at most 1 MiB, and optionally `kind` (`note`, the default, or `doc`), `uri` (shown with search hits) and `metadata` (a JSON object). Anything invalid is a 400 and nothing of that request is written. The body may be up to 128 MiB; more is a 413.
+
+Putting an `external_id` again replaces the document. When its kind, title, text, uri and metadata are all the same as stored, it is skipped and counted in `unchanged`, so repeating a sync is cheap. If one id appears twice in a request, the documents are handled in order and the last one wins. The text is split into sections at markdown headings.
+
+```bash
+lore doc put --source notes --id n1 --title "Review" --text "The quarterly zorblax review moved to Thursdays."
+lore doc put --source wiki --id guide --title "Guide" --file guide.md --kind doc --uri https://example.com/guide
+lore doc get <DOCUMENT_ID>                      # prints the text
+lore doc rm --source notes --id n1
+```
+
+`GET /v1/documents/{id}` (a `read` key) returns `{"id", "kind", "title", "uri", "metadata", "text"}` for any document of the tenant, using the `document_id` of a search hit; the text is cut at 100,000 characters. `DELETE /v1/documents/{source}/{external_id}` (an `ingest` key) answers 204, or 404 when the tenant has no such document; an `external_id` may contain `/`, and other special characters must be percent-encoded. `lore doc put` accepts either `--file` or `--text`, and prints the server's JSON.
+
 ## Ask
 
 `POST /v1/ask` answers a question from the key's tenant, with numbered citations. It needs a `read` key. Fast mode runs one hybrid search (the same as `/v1/search`), puts the best passages in a prompt as numbered sources, and makes one model call.

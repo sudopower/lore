@@ -6,12 +6,14 @@ use serde::Serialize;
 
 pub mod ask;
 pub mod client;
+pub mod doc;
 pub mod otlp;
 pub mod repo;
 pub mod search;
 
 pub use ask::{AskArgs, run_ask};
 pub use client::{Auth, Client};
+pub use doc::{DocCommand, run_doc};
 pub use otlp::{OtlpCommand, run_otlp};
 pub use repo::{RepoCommand, run_repo};
 pub use search::{SearchArgs, run_search};
