@@ -702,6 +702,34 @@ async fn a_megabyte_on_one_line_is_accepted_and_complete(pool: PgPool) {
     assert_eq!(chunks.concat(), line);
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn a_megabyte_heading_line_does_not_multiply_into_every_chunk(pool: PgPool) {
+    let env = Env::new(pool).await;
+    // One heading line of distinct words, as long as the text limit allows. Its text used to be
+    // the symbol of every chunk, which overflowed the tsvector and gave a 500.
+    let mut text = String::from("# ");
+    let mut i = 0;
+    while text.len() + 12 < MIB {
+        text.push_str(&format!("w{i} "));
+        i += 1;
+    }
+    assert!(text.len() > MIB - 20 && text.len() <= MIB);
+    let (status, reply) = env.put(one("heading", &text)).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(reply["chunks"].as_u64().unwrap() > 100, "{reply}");
+
+    let longest: i32 = sqlx::query_scalar(
+        "SELECT coalesce(max(octet_length(s)), 0)::int FROM chunks, unnest(symbols) s",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert!(longest > 0 && longest <= 1024, "{longest}");
+    // The heading line itself is all still there, and searchable.
+    assert_eq!(env.chunk_texts("heading").await.concat(), text);
+    assert!(!env.hits(&format!("w{}", i - 1)).await.is_empty());
+}
+
 // F3: GET returns the text exactly as sent
 
 #[sqlx::test(migrations = "./migrations")]

@@ -6,6 +6,11 @@ use super::{Chunk, ChunkKind};
 const SECTION_MAX_LINES: usize = 120;
 const WINDOW_OVERLAP: usize = 20;
 
+/// The most bytes of a heading that [`chunk_markdown_split`] keeps as a section's symbol. It
+/// matches the title cap in the documents API, so a heading line cannot multiply into every chunk
+/// of its section.
+const MAX_SYMBOL_BYTES: usize = 1024;
+
 /// Splits markdown into sections. A section runs from its heading line to the line before the
 /// next heading, and its symbol is the heading text without the `#`s. Text before the first
 /// heading is a section whose symbol is `default_symbol`. A section over 120 lines becomes
@@ -65,7 +70,15 @@ fn collect(text: &str, default_symbol: &str, split: bool, sink: &mut Sink) -> bo
     }
 
     for (n, (start, heading)) in starts.iter().enumerate() {
-        let symbols = vec![heading.unwrap_or(default_symbol).to_string()];
+        // Split mode is for documents, where a heading line can be as long as the text. Its
+        // symbol is copied into every chunk of the section, so it is cut; the heading line itself
+        // stays in the chunk text. The default symbol is the caller's and is used as given.
+        let symbol = match *heading {
+            Some(h) if split => cut_symbol(h),
+            Some(h) => h,
+            None => default_symbol,
+        };
+        let symbols = vec![symbol.to_string()];
         let end = starts.get(n + 1).map_or(lines.len(), |(next, _)| *next);
         let (mut a, mut b) = (*start, end);
         // Trim blank edges so line ranges describe the text, not the spacing around it.
@@ -105,6 +118,12 @@ fn collect(text: &str, default_symbol: &str, split: bool, sink: &mut Sink) -> bo
         }
     }
     true
+}
+
+/// `s` cut to at most [`MAX_SYMBOL_BYTES`] bytes, on a char boundary.
+fn cut_symbol(s: &str) -> &str {
+    s.get(..s.floor_char_boundary(MAX_SYMBOL_BYTES))
+        .unwrap_or(s)
 }
 
 /// The heading text if `line` is an ATX heading of level 1 to 3: one to three `#`s at the start
@@ -410,6 +429,83 @@ mod tests {
         let mut sink = Sink::new(usize::MAX);
         assert!(collect(&"#\n".repeat(3000), "doc", false, &mut sink));
         assert_eq!(sink.chunks.len(), 3000);
+    }
+
+    #[test]
+    fn a_long_heading_is_cut_in_the_symbol_of_every_chunk_but_not_in_the_text() {
+        let heading: String = (0..20_000).map(|i| format!("w{i} ")).collect();
+        let heading = heading.trim_end();
+        assert!(heading.len() > 100_000);
+        let text = format!("# {heading}\nbody");
+        let chunks = split(&text);
+        assert!(chunks.len() > 10);
+        for c in &chunks {
+            assert_eq!(c.symbols.len(), 1);
+            assert!(
+                c.symbols[0].len() <= MAX_SYMBOL_BYTES,
+                "{}",
+                c.symbols[0].len()
+            );
+            assert!(heading.starts_with(&c.symbols[0]));
+        }
+        assert_eq!(chunks[0].symbols[0].len(), MAX_SYMBOL_BYTES);
+        // The heading line is split like any long line: none of it is lost.
+        assert!(
+            chunks
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+                .starts_with("# w0 w1 ")
+        );
+        assert!(chunks.iter().any(|c| c.text.contains("w19999")));
+        // The default symbol is the caller's and is not touched, even when it is long.
+        let title = "t".repeat(MAX_SYMBOL_BYTES * 3);
+        let chunks = chunk_markdown_split("no heading here", &title, usize::MAX).unwrap();
+        assert_eq!(chunks[0].symbols, vec![title]);
+    }
+
+    #[test]
+    fn a_heading_is_cut_on_a_char_boundary() {
+        // 2 bytes each: the cap falls between characters.
+        let heading = "\u{e9}".repeat(1000);
+        let chunks = split(&format!("# {heading}"));
+        assert_eq!(chunks[0].symbols[0], "\u{e9}".repeat(512));
+        // 3 bytes each: 341 characters are 1,023 bytes, and the 342nd would pass the cap.
+        let heading = "\u{20ac}".repeat(1000);
+        let chunks = split(&format!("# {heading}"));
+        assert_eq!(chunks[0].symbols[0], "\u{20ac}".repeat(341));
+        // 4 bytes each, behind one ASCII byte: the cap falls inside the 256th emoji.
+        let heading = format!("a{}", "\u{1f600}".repeat(1000));
+        let chunks = split(&format!("# {heading}"));
+        assert_eq!(
+            chunks[0].symbols[0],
+            format!("a{}", "\u{1f600}".repeat(255))
+        );
+        for c in &chunks {
+            assert_eq!(c.symbols[0], chunks[0].symbols[0]);
+        }
+    }
+
+    #[test]
+    fn a_heading_at_the_cap_is_kept_whole_and_one_byte_over_is_cut() {
+        let at = "h".repeat(MAX_SYMBOL_BYTES);
+        assert_eq!(split(&format!("# {at}"))[0].symbols, vec![at.clone()]);
+        let over = "h".repeat(MAX_SYMBOL_BYTES + 1);
+        assert_eq!(split(&format!("# {over}"))[0].symbols, vec![at.clone()]);
+        // A two-byte character that straddles the cap is dropped whole.
+        let straddle = format!("{}\u{e9}", "h".repeat(MAX_SYMBOL_BYTES - 1));
+        assert_eq!(
+            split(&format!("# {straddle}"))[0].symbols,
+            vec!["h".repeat(MAX_SYMBOL_BYTES - 1)]
+        );
+    }
+
+    #[test]
+    fn the_plain_mode_keeps_a_long_heading_symbol() {
+        let heading = "h".repeat(MAX_SYMBOL_BYTES * 4);
+        let chunks = chunk_markdown(&format!("# {heading}\nbody"), "doc");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbols, vec![heading]);
     }
 
     #[test]

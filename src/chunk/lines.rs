@@ -249,6 +249,78 @@ mod tests {
         assert_eq!(chunks[0].end_line, 3);
     }
 
+    fn split(lines: &[&str], size: usize, overlap: usize) -> Vec<Chunk> {
+        let mut sink = Sink::new(usize::MAX);
+        assert!(split_windows(
+            lines,
+            0,
+            size,
+            overlap,
+            &[],
+            ChunkKind::Section,
+            &mut sink
+        ));
+        sink.chunks
+    }
+
+    #[test]
+    fn a_joined_window_counts_its_newlines_against_the_budget() {
+        // 4,000 + newline + 4,000 is 8,001 characters, one over, so the lines cannot share.
+        let (a, b) = ("a".repeat(4000), "b".repeat(4000));
+        let chunks = split(&[&a, &b], 120, 0);
+        assert_eq!(chunks.len(), 2);
+        for c in &chunks {
+            assert!(c.text.chars().count() <= MAX_CHUNK_CHARS);
+        }
+    }
+
+    #[test]
+    fn a_window_of_exactly_the_budget_is_kept_whole() {
+        // 3,999 + newline + 4,000 is exactly 8,000 characters and fits.
+        let (a, b) = ("a".repeat(3999), "b".repeat(4000));
+        let chunks = split(&[&a, &b], 120, 0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text.chars().count(), MAX_CHUNK_CHARS);
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn the_overlap_is_at_most_half_of_the_window() {
+        // Seven 1,000 character lines fit a window. Half of 7 rounds down to an overlap of 3,
+        // not the 20 asked for and not 6.
+        let rows: Vec<String> = (0..20).map(|_| "r".repeat(1000)).collect();
+        let lines: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let chunks = split(&lines, 120, 20);
+        let ranges: Vec<(u32, u32)> = chunks.iter().map(|c| (c.start_line, c.end_line)).collect();
+        assert_eq!(&ranges[..3], &[(1, 7), (5, 11), (9, 15)]);
+    }
+
+    #[test]
+    fn a_cut_looks_for_a_space_only_in_the_last_200_characters() {
+        // The only space is far from the limit, so the piece is cut at the limit.
+        let far = format!("{} {}", "a".repeat(100), "b".repeat(9000));
+        let chunks = split(&[&far], 120, 0);
+        assert_eq!(chunks[0].text.chars().count(), MAX_CHUNK_CHARS);
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, far);
+        // A space in the last 200 characters is used, and the cut falls after it.
+        let near = format!("{} {}", "a".repeat(7850), "b".repeat(9000));
+        let chunks = split(&[&near], 120, 0);
+        assert_eq!(chunks[0].text.chars().count(), 7851);
+        assert!(chunks[0].text.ends_with(' '));
+    }
+
+    #[test]
+    fn whitespace_only_windows_are_not_chunks_in_split_mode() {
+        // Windows of two lines: the middle one is blank and gets no chunk.
+        let lines = ["a", "", "  ", "\t", "", "b"];
+        let chunks = split(&lines, 2, 0);
+        let ranges: Vec<(u32, u32)> = chunks.iter().map(|c| (c.start_line, c.end_line)).collect();
+        assert_eq!(ranges, vec![(1, 2), (5, 6)]);
+        assert!(chunks.iter().all(|c| !c.text.trim().is_empty()));
+        assert!(split(&["", " ", "\t"], 2, 0).is_empty());
+    }
+
     #[test]
     fn one_very_long_line_is_a_single_truncated_chunk() {
         let chunks = chunk(&"x".repeat(100_000));
