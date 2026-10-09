@@ -52,13 +52,14 @@ To restore, on the server. The dump only creates objects, so loading it over a d
 cd /opt/lore
 export VERSION=<deployed tag> LORE_DOMAIN=<domain>
 C="docker compose --env-file .env.prod -f compose.prod.yml"
+gunzip -t backups/<file> &&
 $C stop lore backup &&
 $C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' &&
 gunzip -c backups/<file> | $C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore &&
 $C up -d --wait
 ```
 
-`compose.prod.yml` refuses to load without `VERSION` and `LORE_DOMAIN`, so set them to the values of the running deployment first; without them the first command fails before anything is changed. The steps are chained with `&&`, so a failed load never reaches `up`.
+`compose.prod.yml` refuses to load without `VERSION` and `LORE_DOMAIN`, so set them to the values of the running deployment first, replacing the whole placeholder, `<` and `>` included; without them the first compose command fails before anything is changed. The first link, `gunzip -t`, checks that the dump file exists and is intact before anything is touched (a pipe reports psql's status, not gunzip's, so a bad file would otherwise pass). The steps are chained with `&&`, so a failed load never reaches `up`. If the load fails, lore stays stopped: fix the cause and run the block again.
 
 The dump creates the `vector` extension again, so nothing else is needed. `ON_ERROR_STOP=1` makes psql stop at the first error instead of exiting 0 over a half-loaded database.
 
