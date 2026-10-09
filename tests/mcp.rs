@@ -423,3 +423,32 @@ async fn the_host_header_is_unchecked_unless_allowed_hosts_are_set(pool: PgPool)
     .await;
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ask_refuses_a_question_over_2000_characters_in_both_modes(pool: PgPool) {
+    let (url, key, _) = start(pool).await;
+    let client = connect(&url, &key).await;
+
+    for mode in ["fast", "deep"] {
+        let long = call(
+            &client,
+            "ask",
+            json!({ "question": "\u{e9}".repeat(2001), "mode": mode }),
+        )
+        .await;
+        assert!(is_error(&long), "{mode}");
+        let text = texts(&long).join("\n");
+        assert!(
+            text.contains("question must be at most 2000 characters"),
+            "{text}"
+        );
+    }
+    let ok = call(
+        &client,
+        "ask",
+        json!({ "question": "\u{e9}".repeat(2000), "mode": "deep" }),
+    )
+    .await;
+    assert!(!is_error(&ok), "{:?}", texts(&ok));
+    client.cancel().await.unwrap();
+}

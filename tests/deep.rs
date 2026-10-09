@@ -661,3 +661,271 @@ async fn a_timeout_after_some_text_returns_that_text(pool: PgPool) {
     assert_eq!(res.usage.input_tokens, 3);
     assert_eq!(res.mode, Mode::Deep);
 }
+
+// Question length. Both modes refuse a question over 2000 characters (not bytes) with a 400 that
+// names `question`, before deep mode takes a slot of the day.
+
+const TOO_LONG: &str = "question must be at most 2000 characters";
+
+async fn ask_with(env: &Env, question: &str, mode: &str) -> (StatusCode, Value) {
+    let body = json!({ "question": question, "mode": mode });
+    send(
+        &env.router,
+        "POST",
+        "/v1/ask",
+        &env.key,
+        body.to_string().into_bytes(),
+    )
+    .await
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_fast_question_over_2000_characters_is_a_400(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+
+    let (status, body) = ask_with(&env, &"a".repeat(2001), "fast").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], TOO_LONG);
+    let (status, body) = ask_with(&env, &"\u{e9}".repeat(2001), "fast").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], TOO_LONG);
+
+    // 2000 characters are fine, ASCII or multi-byte (4000 bytes), and so is padding around them.
+    for ok in [
+        "a".repeat(2000),
+        "\u{e9}".repeat(2000),
+        format!("  {}  ", "a".repeat(2000)),
+    ] {
+        let (status, body) = ask_with(&env, &ok, "fast").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_deep_question_over_2000_characters_is_a_400_and_uses_no_allowance(pool: PgPool) {
+    let probe = Probe::fake();
+    let env = Env::new(pool, probe.clone(), |cfg| cfg.deep_daily_limit = 1).await;
+
+    for long in ["a".repeat(2001), "\u{e9}".repeat(2001)] {
+        let (status, body) = ask_with(&env, &long, "deep").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], TOO_LONG);
+    }
+    assert!(probe.calls().is_empty(), "the model was called");
+
+    // The day's one question is still there, and exactly 2000 characters (4000 bytes) pass.
+    let (status, body) = ask_with(&env, &"\u{e9}".repeat(2000), "deep").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "deep");
+    // That one used it up.
+    let (status, body) = ask_with(&env, QUESTION, "deep").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+// The slot. The first question holds its model call, so it holds its permit; the second one
+// waits the 5 second slot wait on a paused clock and is refused; once the first has ended, a
+// third one gets the slot. Nothing here touches the database after the pause (no citations).
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_running_question_holds_its_slot_until_it_ends(pool: PgPool) {
+    let probe = Probe::scripted(vec![Step::Hang, answer_text("Second.")]);
+    let env = Env::new(pool, probe.clone(), |cfg| {
+        cfg.deep_concurrency = 1;
+        cfg.deep_budget_secs = 5;
+    })
+    .await;
+
+    tokio::time::pause();
+    let first = {
+        let state = env.state.clone();
+        let tenant = env.tenant;
+        tokio::spawn(async move { ask(&state, tenant, deep_request()).await })
+    };
+    while probe.calls().is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let started = tokio::time::Instant::now();
+    let err = ask(&env.state, env.tenant, deep_request())
+        .await
+        .unwrap_err();
+    match err {
+        AppError::TooManyRequests(m) => assert!(m.contains("too many deep-mode"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+        "{waited:?}"
+    );
+    assert_eq!(
+        probe.calls().len(),
+        1,
+        "the refused question reached the model"
+    );
+
+    // The first question ends (its call times out after the budget and the grace), freeing the slot.
+    let err = first.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+    let res = ask(&env.state, env.tenant, deep_request()).await.unwrap();
+    assert_eq!(res.answer, "Second.");
+}
+
+// Citation lookups. Documents are inserted directly: a lookup reads only `documents` and
+// `sources`, and the tests need exact paths, ids and `updated_at`.
+
+impl Env {
+    async fn insert_source(&self, kind: &str, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO sources (id, tenant_id, kind, name) VALUES ($1, $2, $3, $4)")
+            .bind(id)
+            .bind(self.tenant)
+            .bind(kind)
+            .bind(name)
+            .execute(&self.state.pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A document of `kind` in `source`. `path` goes in `metadata.path`; `external_id` is the
+    /// path, or the given session id. `age_mins` is how long ago it was last updated.
+    async fn insert_doc(
+        &self,
+        source: Uuid,
+        kind: &str,
+        external_id: &str,
+        path: Option<&str>,
+        age_mins: i32,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let metadata = path.map_or_else(|| json!({}), |p| json!({ "path": p }));
+        sqlx::query(
+            "INSERT INTO documents (id, tenant_id, source_id, external_id, kind, title, metadata,
+                                    content_hash, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'h', now() - make_interval(mins => $8))",
+        )
+        .bind(id)
+        .bind(self.tenant)
+        .bind(source)
+        .bind(external_id)
+        .bind(kind)
+        .bind(external_id)
+        .bind(metadata)
+        .bind(age_mins)
+        .execute(&self.state.pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Asks (deep) with a model that answers `text`, and returns the `document_id` of each citation.
+    async fn cited_ids(&self, text: &str) -> Vec<Option<Uuid>> {
+        let probe = Probe::scripted(vec![answer_text(text)]);
+        let mut state = self.state.clone();
+        state.llm = probe;
+        let router = test_router(state);
+        let (status, body) = ask_deep_as(&router, &self.key).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        citations(&body)
+            .iter()
+            .map(|c| c["document_id"].as_str().map(|s| s.parse().unwrap()))
+            .collect()
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_note_with_the_same_path_is_not_a_citation_target(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+    let docs = env.insert_source("documents", "wiki").await;
+    env.insert_doc(docs, "note", "n1", Some("notes/plan.md"), 0)
+        .await;
+
+    // With the source name (looked up in that source) and without (looked up everywhere).
+    let ids = env
+        .cited_ids("[wiki/notes/plan.md:1-2] [notes/plan.md:1-2]")
+        .await;
+    assert_eq!(ids, [None, None]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_cited_source_name_picks_that_sources_document_and_newest_wins_without_one(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+    let alpha = env.insert_source("repo", "alpha").await;
+    let beta = env.insert_source("repo", "beta").await;
+    let in_alpha = env
+        .insert_doc(alpha, "code", "lib/shared.rs", Some("lib/shared.rs"), 60)
+        .await;
+    // The other source's copy is newer.
+    let in_beta = env
+        .insert_doc(beta, "code", "lib/shared.rs", Some("lib/shared.rs"), 5)
+        .await;
+
+    let ids = env
+        .cited_ids("[alpha/lib/shared.rs:1-2] [beta/lib/shared.rs:1-2] [lib/shared.rs:1-2]")
+        .await;
+    assert_eq!(ids, [Some(in_alpha), Some(in_beta), Some(in_beta)]);
+
+    // Make alpha's copy the newer one: the unprefixed path follows, the prefixed ones do not.
+    sqlx::query("UPDATE documents SET updated_at = now() WHERE id = $1")
+        .bind(in_alpha)
+        .execute(&env.state.pool)
+        .await
+        .unwrap();
+    let ids = env
+        .cited_ids("[beta/lib/shared.rs:1-2] [lib/shared.rs:1-2]")
+        .await;
+    assert_eq!(ids, [Some(in_beta), Some(in_alpha)]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_longest_matching_source_name_wins(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+    let a = env.insert_source("repo", "a").await;
+    let ab = env.insert_source("repo", "a/b").await;
+    // `a` has a file at `b/x.rs`, so reading `a/b/x.rs` as source `a` finds a different document.
+    env.insert_doc(a, "code", "b/x.rs", Some("b/x.rs"), 0).await;
+    let in_ab = env.insert_doc(ab, "code", "x.rs", Some("x.rs"), 0).await;
+
+    let ids = env.cited_ids("[a/b/x.rs:1-3]").await;
+    assert_eq!(ids, [Some(in_ab)]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_session_citation_takes_only_sessions_and_the_newest(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+    let s1 = env.insert_source("traces", "sessions-1").await;
+    let s2 = env.insert_source("traces", "sessions-2").await;
+    let notes = env.insert_source("documents", "wiki").await;
+    let _old = env.insert_doc(s1, "session", "dup-sess", None, 60).await;
+    let newer = env.insert_doc(s2, "session", "dup-sess", None, 30).await;
+    // The newest document of all has the same external id but is a note.
+    env.insert_doc(notes, "note", "dup-sess", None, 1).await;
+    // A note alone does not resolve.
+    env.insert_doc(notes, "note", "only-a-note", None, 1).await;
+
+    let ids = env
+        .cited_ids("[session:dup-sess] [session:only-a-note]")
+        .await;
+    assert_eq!(ids, [Some(newer), None]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn at_most_50_citations_are_resolved_in_order(pool: PgPool) {
+    let env = Env::new(pool, Probe::fake(), |_| {}).await;
+    let text: String = (1..=51).map(|n| format!("[f{n}.rs:1] ")).collect();
+    let probe = Probe::scripted(vec![answer_text(&text)]);
+    let mut state = env.state.clone();
+    state.llm = probe;
+    let router = test_router(state);
+
+    let (status, body) = ask_deep_as(&router, &env.key).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let labels: Vec<&str> = citations(&body)
+        .iter()
+        .map(|c| c["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels.len(), 50, "{labels:?}");
+    assert_eq!(labels[0], "f1.rs:1");
+    assert_eq!(labels[49], "f50.rs:1");
+}

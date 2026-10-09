@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::http::AppState;
+use crate::search::MAX_QUERY_CHARS;
 
 pub mod deep;
 pub mod fast;
@@ -70,16 +71,24 @@ pub struct AskResponse {
     pub latency_ms: u64,
 }
 
-/// Answers `req.question` from the tenant's indexed material. A blank question is a
-/// `BadRequest`, and so is deep mode with a model provider that cannot use tools.
+/// Answers `req.question` from the tenant's indexed material. A blank question and one over
+/// 2000 characters are a `BadRequest`, and so is deep mode with a model provider that cannot use tools.
 pub async fn ask(
     state: &AppState,
     tenant_id: Uuid,
     req: AskRequest,
 ) -> Result<AskResponse, AppError> {
     let started = Instant::now();
-    if req.question.trim().is_empty() {
+    let question = req.question.trim();
+    if question.is_empty() {
         return Err(AppError::BadRequest("question is required".to_string()));
+    }
+    // Checked here, before the mode split and before deep mode takes a slot of the day, so a
+    // refused question costs nothing. Both modes send the question to the model.
+    if question.chars().count() > MAX_QUERY_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "question must be at most {MAX_QUERY_CHARS} characters"
+        )));
     }
     let mut res = match req.mode {
         Mode::Fast => fast::answer(state, tenant_id, &req).await?,
