@@ -48,7 +48,8 @@ impl AppError {
         }
     }
 
-    fn message(&self) -> String {
+    /// The text clients see: the detail of a client error, nothing of an internal one.
+    pub fn message(&self) -> String {
         match self {
             AppError::BadRequest(m)
             | AppError::Forbidden(m)

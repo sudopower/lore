@@ -17,6 +17,7 @@ pgvector = { version = "=0.4.1", features = ["sqlx"] }
 rand = "0.8"
 regex = "1.13.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
@@ -37,5 +38,6 @@ tree-sitter-typescript = "0.23"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6.5"

@@ -9,8 +9,9 @@ use lore::embed::{DIM, Embedder, HashEmbedder};
 use lore::error::AppError;
 use lore::http::AppState;
 use lore::store::{
-    NewDocument, Source, delete_document, document_hash, ensure_source, get_source, index_text,
-    list_sources, replace_chunks, set_indexed_commit, upsert_document,
+    NewDocument, Source, delete_document, document_hash, document_text, ensure_source, get_source,
+    index_text, list_source_summaries, list_sources, replace_chunks, set_indexed_commit,
+    upsert_document,
 };
 use pgvector::Vector;
 use serde_json::json;
@@ -820,4 +821,73 @@ async fn index_text_refuses_mismatched_tenant_source_or_document(pool: PgPool) {
 
     assert_eq!(count(&pool, "documents").await, 0);
     assert_eq!(count(&pool, "chunks").await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn document_text_joins_the_chunks_in_order_for_the_owning_tenant_only(pool: PgPool) {
+    let state = state(&pool);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let src = ensure_source(&pool, a, "repo", "app", None).await.unwrap();
+    let mut d = doc(&src, "a.rs", "h1");
+    d.metadata = json!({ "path": "src/a.rs" });
+    index_text(&state, a, &src, d, two_chunks(), "a.rs")
+        .await
+        .unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM documents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (row, text) = document_text(&pool, a, id).await.expect("owner reads it");
+    assert_eq!(row.id, id);
+    assert_eq!(row.source, "app");
+    assert_eq!(row.kind, "code");
+    assert_eq!(row.title, "title of a.rs");
+    assert_eq!(row.uri.as_deref(), Some("src/a.rs"));
+    assert_eq!(row.path.as_deref(), Some("src/a.rs"));
+    assert_eq!(text, "pub fn limits(plan: Plan) -> Limits\nseats per day");
+
+    assert!(document_text(&pool, b, id).await.is_none(), "other tenant");
+    assert!(document_text(&pool, a, Uuid::new_v4()).await.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn source_summaries_count_documents_per_tenant(pool: PgPool) {
+    let state = state(&pool);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let app = ensure_source(&pool, a, "repo", "app", None).await.unwrap();
+    ensure_source(&pool, a, "repo", "empty", None)
+        .await
+        .unwrap();
+    ensure_source(&pool, b, "repo", "theirs", None)
+        .await
+        .unwrap();
+    for (id, hash) in [("a.rs", "h1"), ("b.rs", "h2")] {
+        index_text(&state, a, &app, doc(&app, id, hash), two_chunks(), id)
+            .await
+            .unwrap();
+    }
+    set_indexed_commit(&pool, app.id, "abc123").await.unwrap();
+
+    let got = list_source_summaries(&pool, a).await.unwrap();
+    let got: Vec<_> = got
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.kind.as_str(),
+                s.indexed_commit.as_deref(),
+                s.documents,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("app", "repo", Some("abc123"), 2),
+            ("empty", "repo", None, 0)
+        ]
+    );
 }

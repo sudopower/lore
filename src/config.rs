@@ -33,6 +33,9 @@ pub struct Config {
     /// `LORE_OPENAI_MODEL`. Required when `llm` is `Openai`; checked by `llm::from_config`.
     pub openai_model: Option<String>,
     pub openai_api_key: Option<String>,
+    /// `LORE_MCP_ALLOWED_HOSTS`: the `Host` values the MCP endpoint accepts. `None` (unset or
+    /// empty) turns the host check off.
+    pub mcp_allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +146,21 @@ impl Config {
             openai_base_url: non_empty("LORE_OPENAI_BASE_URL"),
             openai_model: non_empty("LORE_OPENAI_MODEL"),
             openai_api_key: non_empty("LORE_OPENAI_API_KEY"),
+            mcp_allowed_hosts: parse_hosts(f("LORE_MCP_ALLOWED_HOSTS").as_deref()),
         })
     }
+}
+
+/// Splits a comma separated host list. Blank entries are dropped, and a list with no entries
+/// is `None`.
+fn parse_hosts(raw: Option<&str>) -> Option<Vec<String>> {
+    let hosts: Vec<String> = raw?
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!hosts.is_empty()).then_some(hosts)
 }
 
 #[cfg(test)]
@@ -184,6 +200,27 @@ mod tests {
         assert_eq!(c.openai_base_url, None);
         assert_eq!(c.openai_model, None);
         assert_eq!(c.openai_api_key, None);
+        assert_eq!(c.mcp_allowed_hosts, None);
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_are_split_and_trimmed() {
+        let c = lookup(&[(
+            "LORE_MCP_ALLOWED_HOSTS",
+            " lore.example.com, ,10.0.0.1:8080 ",
+        )])
+        .unwrap();
+        assert_eq!(
+            c.mcp_allowed_hosts,
+            Some(vec![
+                "lore.example.com".to_string(),
+                "10.0.0.1:8080".to_string()
+            ])
+        );
+        for empty in ["", " , "] {
+            let c = lookup(&[("LORE_MCP_ALLOWED_HOSTS", empty)]).unwrap();
+            assert_eq!(c.mcp_allowed_hosts, None);
+        }
     }
 
     #[test]

@@ -8,10 +8,7 @@ use uuid::Uuid;
 use crate::auth::{Caller, Scope};
 use crate::error::AppError;
 use crate::http::{AppQuery, AppState};
-use crate::search::{DEFAULT_K, Hit, SearchQuery, clamp_k, search};
-
-/// A snippet is the first lines of a chunk.
-const SNIPPET_LINES: usize = 40;
+use crate::search::{DEFAULT_K, Hit, SearchQuery, clamp_k, search, snippet};
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -64,14 +61,6 @@ impl From<Hit> for HitItem {
     }
 }
 
-/// The first 40 lines of `text`, joined by `\n`.
-fn snippet(text: &str) -> String {
-    text.lines()
-        .take(SNIPPET_LINES)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// `code,doc` to `["code", "doc"]`. Blank entries are dropped, and no entries at all means no
 /// filter. Whether each kind exists is checked by the search.
 fn parse_kinds(kind: Option<&str>) -> Option<Vec<String>> {
@@ -113,17 +102,6 @@ pub async fn get_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn snippet_is_the_first_40_lines() {
-        let text: String = (1..=100).map(|i| format!("line {i}\n")).collect();
-        let s = snippet(&text);
-        assert_eq!(s.lines().count(), 40);
-        assert!(s.starts_with("line 1\n"));
-        assert!(s.ends_with("line 40"));
-        assert_eq!(snippet("a\nb"), "a\nb");
-        assert_eq!(snippet(""), "");
-    }
 
     #[test]
     fn kinds_are_split_on_commas() {
