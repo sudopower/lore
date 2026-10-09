@@ -142,6 +142,24 @@ pub async fn list_sources(
     .await
 }
 
+/// The id of the tenant's `session` document with this `external_id` (the session id), or `None`.
+/// If several traces sources hold the same session id, the most recently updated one wins.
+pub async fn find_session_document(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    external_id: &str,
+) -> sqlx::Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT id FROM documents
+         WHERE tenant_id = $1 AND kind = 'session' AND external_id = $2
+         ORDER BY updated_at DESC, id LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// A source with its document count, for `list_sources` in the MCP tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
 pub struct SourceSummary {

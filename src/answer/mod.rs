@@ -12,6 +12,7 @@ use crate::http::AppState;
 
 pub mod fast;
 pub mod prompt;
+pub mod tools;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]

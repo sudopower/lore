@@ -9,9 +9,9 @@ use lore::embed::{DIM, Embedder, HashEmbedder};
 use lore::error::AppError;
 use lore::http::AppState;
 use lore::store::{
-    NewDocument, Source, delete_document, document_hash, document_text, ensure_source, get_source,
-    index_text, list_source_summaries, list_sources, replace_chunks, set_indexed_commit,
-    upsert_document,
+    NewDocument, Source, delete_document, document_hash, document_text, ensure_source,
+    find_session_document, get_source, index_text, list_source_summaries, list_sources,
+    replace_chunks, set_indexed_commit, upsert_document,
 };
 use pgvector::Vector;
 use serde_json::json;
@@ -1016,5 +1016,95 @@ async fn source_summaries_count_documents_per_tenant(pool: PgPool) {
             ("app", "repo", Some("abc123"), 2),
             ("empty", "repo", None, 0)
         ]
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn find_session_document_is_tenant_scoped_session_only_and_newest_first(pool: PgPool) {
+    let st = state(&pool);
+    let a = tenant(&st, "acme").await;
+    let b = tenant(&st, "globex").await;
+    let traces_1 = ensure_source(&pool, a, "traces", "traces-1", None)
+        .await
+        .unwrap();
+    let traces_2 = ensure_source(&pool, a, "traces", "traces-2", None)
+        .await
+        .unwrap();
+    let notes = ensure_source(&pool, a, "documents", "notes", None)
+        .await
+        .unwrap();
+    let traces_b = ensure_source(&pool, b, "traces", "traces-b", None)
+        .await
+        .unwrap();
+
+    let put = |source: &Source, kind: &str, hash: &str| {
+        let mut d = doc(source, "sess-1", hash);
+        d.kind = kind.to_string();
+        d
+    };
+    let mut ids = Vec::new();
+    for d in [
+        put(&traces_1, "session", "h1"),
+        put(&traces_2, "session", "h2"),
+        put(&notes, "note", "h3"),
+        put(&traces_b, "session", "h4"),
+    ] {
+        let mut tx = pool.begin().await.unwrap();
+        ids.push(upsert_document(&mut tx, &d).await.unwrap());
+        tx.commit().await.unwrap();
+    }
+    let (first, second, note, other_tenant) = (ids[0], ids[1], ids[2], ids[3]);
+    let stamp = |id: Uuid, when: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE documents SET updated_at = $2::timestamptz WHERE id = $1")
+                .bind(id)
+                .bind(when)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    // The note is the newest of all, so only the kind filter keeps it out.
+    stamp(first, "2026-01-01T00:00:00Z").await;
+    stamp(second, "2026-02-01T00:00:00Z").await;
+    stamp(note, "2026-03-01T00:00:00Z").await;
+    stamp(other_tenant, "2026-04-01T00:00:00Z").await;
+
+    // Newest session wins, and neither the note nor the other tenant's session is picked.
+    assert_eq!(
+        find_session_document(&pool, a, "sess-1").await.unwrap(),
+        Some(second)
+    );
+    // Flip the order: the same query now picks the other source's document.
+    stamp(first, "2026-05-01T00:00:00Z").await;
+    assert_eq!(
+        find_session_document(&pool, a, "sess-1").await.unwrap(),
+        Some(first)
+    );
+    // Each tenant sees only its own.
+    assert_eq!(
+        find_session_document(&pool, b, "sess-1").await.unwrap(),
+        Some(other_tenant)
+    );
+    // A tenant with no such session, and an id that does not exist.
+    let c = tenant(&st, "initech").await;
+    assert_eq!(
+        find_session_document(&pool, c, "sess-1").await.unwrap(),
+        None
+    );
+    assert_eq!(find_session_document(&pool, a, "nope").await.unwrap(), None);
+    // A note alone is not a session.
+    let only_note = ensure_source(&pool, c, "documents", "notes", None)
+        .await
+        .unwrap();
+    let mut d = doc(&only_note, "sess-1", "h5");
+    d.kind = "note".to_string();
+    let mut tx = pool.begin().await.unwrap();
+    upsert_document(&mut tx, &d).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        find_session_document(&pool, c, "sess-1").await.unwrap(),
+        None
     );
 }
