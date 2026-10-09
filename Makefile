@@ -135,4 +135,4 @@ deploy-prod:
 	ssh $(HOST) 'mkdir -p /opt/lore/backups && test -f /opt/lore/.env.prod' || { echo "create /opt/lore/.env.prod first, see docs/self-hosting.md"; exit 1; }
 	scp deploy/compose.prod.yml deploy/Caddyfile $(HOST):/opt/lore/
 	ssh $(HOST) 'cd /opt/lore && VERSION=$(VERSION) LORE_DOMAIN=$(LORE_DOMAIN) docker compose --env-file .env.prod -f compose.prod.yml up -d --wait'
-	curl -s https://$(LORE_DOMAIN)/healthz
+	curl -fsS --retry 10 --retry-delay 3 --retry-all-errors https://$(LORE_DOMAIN)/healthz

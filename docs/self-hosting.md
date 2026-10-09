@@ -46,12 +46,18 @@ Everything else (`repo push`, `search`, `ask`, MCP) goes through `https://<domai
 
 The `backup` service writes `/opt/lore/backups/lore-<date>-<time>.sql.gz` every 24 hours and deletes dumps older than 7 days. Copy them off the server if you want more than one machine's worth of safety.
 
-To restore, on the server:
+To restore, on the server. The dump only creates objects, so loading it over a database that already has the tables fails on duplicate keys and loads nothing. Empty the schema first, with lore stopped:
 
 ```sh
 cd /opt/lore
-gunzip -c backups/<file> | docker compose --env-file .env.prod -f compose.prod.yml exec -T db psql -U lore lore
+C="docker compose --env-file .env.prod -f compose.prod.yml"
+$C stop lore backup
+$C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+gunzip -c backups/<file> | $C exec -T db psql -U lore -v ON_ERROR_STOP=1 lore
+$C up -d --wait
 ```
+
+The dump creates the `vector` extension again, so nothing else is needed. `ON_ERROR_STOP=1` makes psql stop at the first error instead of exiting 0 over a half-loaded database.
 
 The `loredata` volume (repo mirrors and the model cache) is not in the dump. After a restore onto a fresh volume, run `lore repo push --full` for each repo. lore also answers `need_full_bundle`, and the CLI then retries with a full bundle on its own.
 
