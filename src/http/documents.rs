@@ -27,6 +27,8 @@ const MAX_DOCUMENTS: usize = 100;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_EXTERNAL_ID_BYTES: usize = 512;
 const MAX_TITLE_BYTES: usize = 1024;
+/// A search hit repeats the uri, so it is capped like the title.
+const MAX_URI_BYTES: usize = 2048;
 /// Length of the serialized metadata object.
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 /// Chunks per document. Each one is embedded, so this bounds the work a 1 MiB text can cause.
@@ -153,6 +155,9 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
             "{} is over {MAX_TITLE_BYTES} bytes",
             at("title")
         )));
+    }
+    if doc.uri.as_deref().is_some_and(|u| u.len() > MAX_URI_BYTES) {
+        return Err(bad(format!("{} is over {MAX_URI_BYTES} bytes", at("uri"))));
     }
     if doc.text.len() > MAX_TEXT_BYTES {
         return Err(bad(format!("{} is over 1 MiB", at("text"))));
@@ -396,6 +401,25 @@ mod tests {
         let mut d = doc("a");
         d.metadata = Some(json!({"k": "m".repeat(MAX_METADATA_BYTES - 7)}));
         assert!(message(prepare(0, d)).contains("metadata"));
+    }
+
+    #[test]
+    fn uri_has_a_size_limit_in_bytes() {
+        let mut d = doc("a");
+        d.uri = Some("u".repeat(MAX_URI_BYTES));
+        assert!(prepare(0, d).is_ok());
+        let mut d = doc("a");
+        d.uri = Some("u".repeat(MAX_URI_BYTES + 1));
+        let m = message(prepare(0, d));
+        assert!(m.contains("documents[0].uri") && m.contains("2048"), "{m}");
+        // Bytes, not characters.
+        let mut d = doc("a");
+        d.uri = Some("\u{e9}".repeat(MAX_URI_BYTES / 2 + 1));
+        assert!(message(prepare(0, d)).contains("uri"));
+        // No uri, and an empty one, are fine.
+        let mut d = doc("a");
+        d.uri = Some(String::new());
+        assert!(prepare(0, d).is_ok());
     }
 
     #[test]

@@ -496,6 +496,39 @@ async fn the_title_is_limited_to_1024_bytes(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn the_uri_is_limited_to_2048_bytes_and_nothing_of_the_request_is_written(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let at = request("s", doc_with("a", json!({ "uri": "u".repeat(2048) })));
+    let (status, reply) = env.put(at).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    for table in ["documents", "chunks", "sources"] {
+        assert_eq!(env.count(table).await, 1, "{table}");
+    }
+
+    // A good document before and after the bad one: none of the three is written.
+    for bad_uri in ["u".repeat(2049), "\u{e9}".repeat(1025)] {
+        let body = json!({
+            "source": "other",
+            "documents": [
+                doc_with("first", json!({})),
+                doc_with("bad", json!({ "uri": bad_uri })),
+                doc_with("last", json!({})),
+            ]
+        });
+        let (status, reply) = env.put(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        let message = reply["error"].as_str().unwrap();
+        assert!(
+            message.contains("documents[1].uri") && message.contains("2048"),
+            "{message}"
+        );
+        for table in ["documents", "chunks", "sources"] {
+            assert_eq!(env.count(table).await, 1, "{table}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn the_metadata_is_limited_to_64_kib(pool: PgPool) {
     let env = Env::new(pool).await;
     // `{"k":"..."}` is 8 bytes around the value.
