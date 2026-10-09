@@ -1108,3 +1108,93 @@ async fn find_session_document_is_tenant_scoped_session_only_and_newest_first(po
         None
     );
 }
+
+fn span(name: &str, pending: bool) -> lore::otlp::SpanRow {
+    let now = chrono::Utc::now();
+    lore::otlp::SpanRow {
+        trace_id: "t1".to_string(),
+        span_id: "s1".to_string(),
+        parent_span_id: None,
+        session_id: "sess-1".to_string(),
+        name: name.to_string(),
+        kind: "internal".to_string(),
+        start_time: now,
+        end_time: now,
+        status_code: "ok".to_string(),
+        status_message: None,
+        resource: Arc::new(json!({})),
+        attributes: if pending {
+            json!({ "glassflow.span.pending": true })
+        } else {
+            json!({})
+        },
+        events: json!([]),
+    }
+}
+
+async fn put_spans(pool: &PgPool, tenant_id: Uuid, rows: &[lore::otlp::SpanRow]) {
+    let mut tx = pool.begin().await.unwrap();
+    lore::store::upsert_spans(&mut tx, tenant_id, rows)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn stored_span(pool: &PgPool, tenant_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT name FROM spans WHERE tenant_id = $1 AND span_id = 's1'")
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_pending_span_never_replaces_a_finished_one_in_the_database(pool: PgPool) {
+    let st = state(&pool);
+    let t = tenant(&st, "acme").await;
+
+    put_spans(&pool, t, &[span("finished", false)]).await;
+    put_spans(&pool, t, &[span("late snapshot", true)]).await;
+    assert_eq!(stored_span(&pool, t).await, "finished");
+
+    // A finished span still replaces a finished one.
+    put_spans(&pool, t, &[span("finished again", false)]).await;
+    assert_eq!(stored_span(&pool, t).await, "finished again");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_finished_span_replaces_a_pending_one_and_a_pending_one_replaces_a_pending_one(
+    pool: PgPool,
+) {
+    let st = state(&pool);
+    let t = tenant(&st, "acme").await;
+
+    put_spans(&pool, t, &[span("first snapshot", true)]).await;
+    put_spans(&pool, t, &[span("second snapshot", true)]).await;
+    assert_eq!(stored_span(&pool, t).await, "second snapshot");
+    put_spans(&pool, t, &[span("finished", false)]).await;
+    assert_eq!(stored_span(&pool, t).await, "finished");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_pending_copy_after_a_finished_one_in_the_same_batch_loses(pool: PgPool) {
+    let st = state(&pool);
+    let t = tenant(&st, "acme").await;
+
+    put_spans(&pool, t, &[span("finished", false), span("snapshot", true)]).await;
+    assert_eq!(stored_span(&pool, t).await, "finished");
+
+    // The last copy still wins among spans of the same kind, in either order.
+    let other = tenant(&st, "globex").await;
+    put_spans(
+        &pool,
+        other,
+        &[span("snapshot", true), span("finished", false)],
+    )
+    .await;
+    assert_eq!(stored_span(&pool, other).await, "finished");
+    put_spans(&pool, other, &[span("one", false), span("two", false)]).await;
+    assert_eq!(stored_span(&pool, other).await, "two");
+    put_spans(&pool, other, &[span("three", true), span("four", true)]).await;
+    assert_eq!(stored_span(&pool, other).await, "two");
+}

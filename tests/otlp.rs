@@ -266,6 +266,103 @@ async fn a_resent_span_is_updated_in_place(pool: PgPool) {
     assert_eq!(env.span_count(env.tenant).await, 5);
 }
 
+/// The fixture with `ripgrep exited with code 2` replaced by `message`, and every span marked as
+/// an unfinished snapshot when `pending` is set.
+fn fixture_with(message: &str, pending: bool) -> String {
+    let mut v: Value =
+        serde_json::from_str(&CLAUDE_CODE.replace("ripgrep exited with code 2", message)).unwrap();
+    if pending {
+        for rs in v["resourceSpans"].as_array_mut().unwrap() {
+            for ss in rs["scopeSpans"].as_array_mut().unwrap() {
+                for span in ss["spans"].as_array_mut().unwrap() {
+                    span["attributes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "key": "glassflow.span.pending",
+                            "value": { "boolValue": true }
+                        }));
+                }
+            }
+        }
+    }
+    v.to_string()
+}
+
+impl Env {
+    /// The status message and pending flag of the Grep span.
+    async fn grep_span(&self) -> (String, bool) {
+        sqlx::query_as(
+            "SELECT status_message, COALESCE(attributes -> 'glassflow.span.pending' = 'true'::jsonb, false) \
+             FROM spans WHERE tenant_id = $1 AND name = 'execute_tool Grep'",
+        )
+        .bind(self.tenant)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_pending_snapshot_never_replaces_a_finished_span(pool: PgPool) {
+    let env = Env::new(pool).await;
+    assert_eq!(
+        env.post_json(&fixture_with("finished", false))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("finished".to_string(), false));
+
+    // A late pending snapshot is accepted and ignored.
+    assert_eq!(
+        env.post_json(&fixture_with("late snapshot", true))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("finished".to_string(), false));
+    assert_eq!(env.span_count(env.tenant).await, 5);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_finished_span_replaces_a_pending_one_and_a_pending_replaces_a_pending(pool: PgPool) {
+    let env = Env::new(pool).await;
+    assert_eq!(
+        env.post_json(&fixture_with("first snapshot", true))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("first snapshot".to_string(), true));
+
+    assert_eq!(
+        env.post_json(&fixture_with("second snapshot", true))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("second snapshot".to_string(), true));
+
+    assert_eq!(
+        env.post_json(&fixture_with("finished", false))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("finished".to_string(), false));
+
+    // A finished span still replaces a finished one.
+    assert_eq!(
+        env.post_json(&fixture_with("finished again", false))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(env.grep_span().await, ("finished again".to_string(), false));
+    assert_eq!(env.span_count(env.tenant).await, 5);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn sessions_are_queued_once(pool: PgPool) {
     let env = Env::new(pool).await;

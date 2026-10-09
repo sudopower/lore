@@ -5,9 +5,11 @@
 //! gone quiet, renders them and indexes the result.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,7 +18,7 @@ use uuid::Uuid;
 
 use crate::chunk::chunk_markdown;
 use crate::http::AppState;
-use crate::otlp::SpanRow;
+use crate::otlp::{SpanRow, TRUNCATED_SUFFIX};
 use crate::store::{self, NewDocument};
 
 /// A rendered session: what gets indexed.
@@ -94,13 +96,85 @@ fn defang(s: &str) -> String {
     out
 }
 
+/// The messages of a `gen_ai.*.messages` attribute. `cut` is true when the attribute was a JSON
+/// string that no longer parses (ingest cuts strings at 64 KiB) and `items` are only what could
+/// be read from its start.
+struct Messages {
+    items: Vec<Value>,
+    cut: bool,
+}
+
+static ROLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""role"\s*:\s*"([^"\\]*)""#).expect("the role pattern is valid"));
+static TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""(?:content|text)"\s*:\s*"((?:[^"\\]|\\.)*)"#).expect("the text pattern is valid")
+});
+
+/// The text of a JSON string body that may end in the middle of an escape.
+fn unescape_json(raw: &str) -> String {
+    let parse = |s: &str| serde_json::from_str::<String>(&format!("\"{s}\"")).ok();
+    parse(raw)
+        .or_else(|| raw.rfind('\\').and_then(|i| parse(&raw[..i])))
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// A message from the end of a cut history, where the element itself is cut: its role and the
+/// start of its first text.
+fn partial_message(rest: &str) -> Option<Value> {
+    let role = ROLE.captures(rest)?.get(1)?.as_str();
+    let text = TEXT
+        .captures(rest)
+        .and_then(|c| c.get(1))
+        .map(|m| unescape_json(m.as_str()))
+        .unwrap_or_default();
+    Some(serde_json::json!({ "role": role, "content": text }))
+}
+
+/// The messages that can be read from a JSON array that was cut: every complete element at its
+/// start, then the role and the start of the text of the element that was cut.
+fn salvage_messages(s: &str) -> Vec<Value> {
+    let s = s.strip_suffix(TRUNCATED_SUFFIX).unwrap_or(s);
+    let mut rest = s.trim_start().strip_prefix('[').unwrap_or(s);
+    let mut items = Vec::new();
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        if rest.is_empty() || rest.starts_with(']') {
+            break;
+        }
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(value)) => {
+                let used = stream.byte_offset();
+                if value.is_object() {
+                    items.push(value);
+                }
+                rest = &rest[used..];
+            }
+            _ => {
+                items.extend(partial_message(rest));
+                break;
+            }
+        }
+    }
+    items
+}
+
 /// A JSON array of messages, from an attribute that holds it as a JSON string or as an array.
-fn parse_messages(value: &Value) -> Option<Vec<Value>> {
+/// `None` when the attribute is neither.
+fn parse_messages(value: &Value) -> Option<Messages> {
     match value {
-        Value::Array(a) => Some(a.clone()),
-        Value::String(s) => match serde_json::from_str::<Value>(s).ok()? {
-            Value::Array(a) => Some(a),
-            _ => None,
+        Value::Array(a) => Some(Messages {
+            items: a.clone(),
+            cut: false,
+        }),
+        Value::String(s) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(items)) => Some(Messages { items, cut: false }),
+            Ok(_) => None,
+            Err(_) if s.trim_start().starts_with('[') => Some(Messages {
+                items: salvage_messages(s),
+                cut: true,
+            }),
+            Err(_) => None,
         },
         _ => None,
     }
@@ -130,39 +204,59 @@ fn message_text(message: &Value) -> String {
         .to_string()
 }
 
+fn role_of(message: &Value) -> &str {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+}
+
+/// System and developer messages are instructions, not something the user said.
+fn is_instruction(message: &Value) -> bool {
+    matches!(role_of(message), "system" | "developer")
+}
+
 /// The `(role, text)` pairs the user side of an LLM call adds: the messages after the last
-/// assistant message, or `input.value` as one `user` message when there are no input messages.
+/// assistant message, without system messages, or `input.value` as one `user` message when there
+/// are no input messages. When the history was cut, only the last user turn that can still be
+/// read is returned, or `input.value` when there is none.
 fn user_messages(span: &SpanRow) -> Vec<(String, String)> {
     let parsed = span
         .attributes
         .get("gen_ai.input.messages")
         .and_then(parse_messages);
-    let Some(messages) = parsed else {
-        return match attr_text(span, "input.value") {
-            Some(v) => vec![("user".to_string(), v)],
-            None => Vec::new(),
-        };
+    let from_input_value = || match attr_text(span, "input.value") {
+        Some(v) => vec![("user".to_string(), v)],
+        None => Vec::new(),
     };
-    let start = messages
+    let Some(Messages { items, cut }) = parsed else {
+        return from_input_value();
+    };
+    let pairs = |messages: &[Value]| -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter(|m| !is_instruction(m))
+            .map(|m| (role_of(m).to_string(), message_text(m)))
+            .filter(|(_, text)| !text.trim().is_empty())
+            .collect()
+    };
+    if cut {
+        let last_user = pairs(&items).into_iter().rfind(|(role, _)| role == "user");
+        return last_user.map_or_else(from_input_value, |m| vec![m]);
+    }
+    let start = items
         .iter()
         .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .map_or(0, |i| i + 1);
-    messages[start..]
-        .iter()
-        .map(|m| {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-            (role.to_string(), message_text(m))
-        })
-        .filter(|(_, text)| !text.trim().is_empty())
-        .collect()
+    pairs(&items[start..])
 }
 
 /// What the model said: every output message, or `output.value`.
 fn model_text(span: &SpanRow) -> Option<String> {
     if let Some(value) = span.attributes.get("gen_ai.output.messages") {
         match parse_messages(value) {
-            Some(messages) => {
-                let text = messages
+            Some(Messages { items, cut }) => {
+                let text = items
                     .iter()
                     .map(message_text)
                     .filter(|t| !t.trim().is_empty())
@@ -170,6 +264,10 @@ fn model_text(span: &SpanRow) -> Option<String> {
                     .join("\n");
                 if !text.is_empty() {
                     return Some(text);
+                }
+                // A cut history with nothing readable in it is shown as it is.
+                if let Some(raw) = value.as_str().filter(|s| cut && !s.trim().is_empty()) {
+                    return Some(raw.to_string());
                 }
             }
             None => {
@@ -685,6 +783,120 @@ mod tests {
         assert!(t.contains("agent: genai-fixture-app\n"), "{t}");
         assert!(t.contains("models: gpt-5\n"), "{t}");
         assert_eq!(doc.title, "How many plans do we have?");
+    }
+
+    fn chat_with_input(history: Value) -> SpanRow {
+        span(
+            "aaaa000000000001",
+            0,
+            json!({
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": history,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_system_message_is_not_the_user_turn() {
+        let history = json!([
+            { "role": "system", "parts": [{ "type": "text", "content": "You are a careful assistant." }] },
+            { "role": "user", "parts": [{ "type": "text", "content": "What is the seat limit?" }] },
+        ]);
+        let doc = render(&[chat_with_input(history.clone())]);
+        assert!(
+            doc.text.contains("user: What is the seat limit?"),
+            "{}",
+            doc.text
+        );
+        assert!(!doc.text.contains("careful assistant"), "{}", doc.text);
+        assert!(!doc.text.contains("system:"), "{}", doc.text);
+        assert_eq!(doc.title, "What is the seat limit?");
+        // The history may also arrive as a JSON string.
+        let as_string = render(&[chat_with_input(Value::String(history.to_string()))]);
+        assert_eq!(as_string.text, doc.text);
+    }
+
+    #[test]
+    fn a_long_system_message_does_not_use_up_the_user_text() {
+        let history = json!([
+            { "role": "system", "content": "S".repeat(5000) },
+            { "role": "user", "content": "Where is the billing code?" },
+        ]);
+        let doc = render(&[chat_with_input(history)]);
+        assert!(
+            doc.text.contains("user: Where is the billing code?"),
+            "{}",
+            doc.text
+        );
+        assert!(!doc.text.contains("SSSS"), "{}", doc.text);
+        assert_eq!(doc.title, "Where is the billing code?");
+    }
+
+    #[test]
+    fn a_history_cut_at_64_kib_still_shows_a_user_turn() {
+        let mut messages = vec![json!({ "role": "system", "content": "Be brief. ".repeat(500) })];
+        for n in 0..120 {
+            messages.push(
+                json!({ "role": "user", "content": format!("question {n} {}", "q".repeat(900)) }),
+            );
+            messages.push(json!({ "role": "assistant", "content": format!("answer {n} {}", "a".repeat(900)) }));
+        }
+        messages.push(json!({ "role": "user", "content": "the final question" }));
+        let full = Value::Array(messages).to_string();
+        assert!(full.len() > 64 * 1024);
+        let stored = crate::otlp::clean_string(&full);
+        assert!(stored.ends_with(TRUNCATED_SUFFIX));
+        assert!(serde_json::from_str::<Value>(&stored).is_err());
+
+        let doc = render(&[chat_with_input(Value::String(stored.clone()))]);
+        let last_label = Regex::new(r"question (\d+) ")
+            .unwrap()
+            .captures_iter(&stored)
+            .last()
+            .map(|c| c[1].to_string())
+            .expect("some question survives the cut");
+        assert!(
+            doc.text
+                .contains(&format!("user: question {last_label} qqq")),
+            "{}",
+            doc.text
+        );
+        assert_eq!(count(&doc.text, "user: "), 1, "{}", doc.text);
+        for raw in ["\"role\"", "\"content\"", "Be brief", "[truncated]", "{\""] {
+            assert!(!doc.text.contains(raw), "{raw} in {}", doc.text);
+        }
+        assert_eq!(
+            doc.title,
+            format!("question {last_label} {}", "q".repeat(900))
+                .chars()
+                .take(80)
+                .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn a_cut_history_without_a_readable_user_turn_uses_input_value() {
+        let stored = format!(
+            "[{{\"role\":\"system\",\"content\":\"{}{TRUNCATED_SUFFIX}",
+            "x".repeat(100)
+        );
+        let mut s = chat_with_input(Value::String(stored));
+        s.attributes["input.value"] = json!("typed question");
+        let doc = render(&[s]);
+        assert!(doc.text.contains("user: typed question"), "{}", doc.text);
+        assert!(!doc.text.contains("xxxx"), "{}", doc.text);
+    }
+
+    #[test]
+    fn salvage_reads_whole_elements_and_the_start_of_the_cut_one() {
+        let cut = r#"[{"role":"system","content":"s"},{"role":"user","content":"one"},{"role":"user","parts":[{"type":"text","content":"say \"hi\" \u00"#;
+        let items = salvage_messages(&format!("{cut}{TRUNCATED_SUFFIX}"));
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[1]["content"], "one");
+        assert_eq!(items[2]["role"], "user");
+        assert_eq!(items[2]["content"], "say \"hi\" ");
+        assert!(salvage_messages("[").is_empty());
+        assert!(salvage_messages("[{\"ro").is_empty());
     }
 
     #[test]

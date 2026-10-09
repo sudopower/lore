@@ -556,6 +556,76 @@ async fn the_metadata_is_limited_to_64_kib(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn metadata_path_is_limited_to_2048_bytes_and_comes_back_whole_at_the_limit(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let note =
+        |id: &str, path: Value| doc_with(id, json!({ "text": NOTE, "metadata": { "path": path } }));
+    let whole = "p".repeat(2048);
+    let (status, reply) = env.put(request("s", note("a", json!(whole)))).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let hits = env.hits("zorblax").await;
+    assert_eq!(hits[0]["path"], json!(whole));
+
+    for bad in [
+        json!("p".repeat(60 * 1024)),
+        json!("\u{e9}".repeat(1025)),
+        json!(["x".repeat(2048)]),
+    ] {
+        let body = json!({
+            "source": "other",
+            "documents": [doc_with("first", json!({})), note("bad", bad)],
+        });
+        let (status, reply) = env.put(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        let message = reply["error"].as_str().unwrap();
+        assert!(
+            message.contains("documents[1].metadata.path") && message.contains("2048"),
+            "{message}"
+        );
+        assert_eq!(env.count("documents").await, 1);
+        assert_eq!(env.count("sources").await, 1);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn search_cuts_a_stored_path_to_2048_bytes_on_a_char_boundary(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (status, reply) = env.put(one("n1", NOTE)).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let set_path = |path: String| {
+        let pool = env.pool.clone();
+        async move {
+            sqlx::query("UPDATE documents SET metadata = jsonb_build_object('path', $1::text)")
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Paths stored before the limit existed can be as long as the metadata allows.
+    set_path("p".repeat(60 * 1024)).await;
+    let hits = env.hits("zorblax").await;
+    assert_eq!(hits[0]["path"], json!("p".repeat(2048)));
+
+    // 'a' then 2-byte characters: byte 2048 falls inside a character, so the cut is at 2047.
+    set_path(format!("a{}", "\u{e9}".repeat(1500))).await;
+    let hits = env.hits("zorblax").await;
+    let path = hits[0]["path"].as_str().unwrap();
+    assert_eq!(path.len(), 2047);
+    assert!(path.starts_with("a\u{e9}\u{e9}") && path.ends_with('\u{e9}'));
+
+    // 4-byte characters: 512 of them are exactly 2048 bytes.
+    set_path("\u{1F600}".repeat(700)).await;
+    let hits = env.hits("zorblax").await;
+    assert_eq!(hits[0]["path"], json!("\u{1F600}".repeat(512)));
+
+    set_path("src/lib.rs".to_string()).await;
+    let hits = env.hits("zorblax").await;
+    assert_eq!(hits[0]["path"], json!("src/lib.rs"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn more_than_1000_chunks_is_400_and_nothing_of_the_request_is_written(pool: PgPool) {
     let env = Env::new(pool).await;
     let body = json!({

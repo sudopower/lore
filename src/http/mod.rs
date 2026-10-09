@@ -47,10 +47,12 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     // The limit is on the bundle route only: other routes keep axum's own defaults.
     let bundle_limit = usize::try_from(state.config.max_bundle_bytes).unwrap_or(usize::MAX);
-    // MCP clients get 401/403 from the middleware before rmcp sees the request.
+    // MCP clients get 401/403 from the middleware before rmcp sees the request. `route_layer`
+    // wraps only the matched /mcp routes, so an unknown path stays a 404 whether or not it has
+    // a key (`layer` would answer every unknown path with 401).
     let mcp = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
-        .layer(from_fn_with_state(state.clone(), mcp::require_caller));
+        .route_layer(from_fn_with_state(state.clone(), mcp::require_caller));
     Router::new()
         .merge(mcp)
         .route("/", get(web::index))

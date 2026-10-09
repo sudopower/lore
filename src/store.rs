@@ -5,6 +5,8 @@
 //! Vocabulary: a "source kind" is `sources.kind` (`repo`, `traces`, `documents`); a "document kind"
 //! is `documents.kind` (`code`, `doc`, `session`, `note`).
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 use pgvector::Vector;
 use serde::Serialize;
@@ -12,9 +14,10 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::chunk::{Chunk, embed_text, lexical_text};
-use crate::embed::embed_documents_async;
+use crate::embed::{DIM, embed_documents_async};
 use crate::error::AppError;
 use crate::http::AppState;
+use crate::sessions::is_pending;
 
 const SOURCE_KINDS: [&str; 3] = ["repo", "traces", "documents"];
 
@@ -435,8 +438,48 @@ pub async fn delete_document(
     Ok(res.rows_affected() > 0)
 }
 
+/// The key under which a stored embedding is found again: the part of `embed_text` that comes
+/// after the title (the symbols, then the text).
+fn embedding_key(text: &str, symbols: &[String]) -> String {
+    format!("{}\n{}", symbols.join(" "), text)
+}
+
+/// The embeddings of the chunks the document `(source, external_id)` holds now, by
+/// [`embedding_key`]. Empty when the document is new or its stored title is not `title_for_embed`,
+/// because then the stored vectors were made from another `embed_text`. All callers of
+/// `index_text` store the title they embed with, so a stored title that differs means the title
+/// changed and every chunk has to be embedded again.
+async fn stored_embeddings(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    source_id: Uuid,
+    external_id: &str,
+    title_for_embed: &str,
+) -> sqlx::Result<HashMap<String, Vec<f32>>> {
+    let rows: Vec<(String, Vec<String>, Vector)> = sqlx::query_as(
+        "SELECT c.text, c.symbols, c.embedding
+         FROM chunks c JOIN documents d ON d.id = c.document_id
+         WHERE d.tenant_id = $1 AND c.tenant_id = $1 AND d.source_id = $2
+           AND d.external_id = $3 AND d.title = $4",
+    )
+    .bind(tenant_id)
+    .bind(source_id)
+    .bind(external_id)
+    .bind(title_for_embed)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(text, symbols, v)| (embedding_key(&text, &symbols), v.to_vec()))
+        .collect())
+}
+
 /// The shared indexing path (repos, sessions, documents): embeds the chunks, then stores the
 /// document and its chunks in one short transaction. Returns the chunk count.
+///
+/// A chunk whose text and symbols equal those of a chunk the document already has (and whose
+/// title is unchanged) keeps the stored embedding, so only new or changed chunks reach the
+/// embedder. This is what keeps a growing session cheap to index again.
 ///
 /// The embedding runs before the transaction opens, so no connection is held while the model
 /// works. `title_for_embed` is the path or title passed to `embed_text`.
@@ -452,15 +495,44 @@ pub async fn index_text(
         bail!("document does not belong to the source and tenant");
     }
     let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
-    let texts: Vec<String> = chunks
+    let stored = stored_embeddings(
+        &state.pool,
+        tenant_id,
+        source.id,
+        &doc.external_id,
+        title_for_embed,
+    )
+    .await?;
+    let mut embeddings: Vec<Option<Vec<f32>>> = chunks
         .iter()
-        .map(|c| embed_text(title_for_embed, c))
+        .map(|c| {
+            stored
+                .get(&embedding_key(&c.text, &c.symbols))
+                .filter(|v| v.len() == DIM)
+                .cloned()
+        })
         .collect();
-    let embeddings = if texts.is_empty() {
-        Vec::new()
-    } else {
-        embed_documents_async(state.embedder.clone(), texts).await?
-    };
+    let missing: Vec<usize> = (0..chunks.len())
+        .filter(|i| embeddings[*i].is_none())
+        .collect();
+    if !missing.is_empty() {
+        let texts: Vec<String> = missing
+            .iter()
+            .map(|i| embed_text(title_for_embed, &chunks[*i]))
+            .collect();
+        let fresh = embed_documents_async(state.embedder.clone(), texts).await?;
+        if fresh.len() != missing.len() {
+            bail!(
+                "embedder returned {} vectors for {} chunks",
+                fresh.len(),
+                missing.len()
+            );
+        }
+        for (i, v) in missing.into_iter().zip(fresh) {
+            embeddings[i] = Some(v);
+        }
+    }
+    let embeddings: Vec<Vec<f32>> = embeddings.into_iter().flatten().collect();
     if embeddings.len() != chunks.len() {
         bail!(
             "embedder returned {} vectors for {} chunks",
@@ -492,18 +564,32 @@ const SPAN_INSERT_CHUNK: usize = 1000;
 /// Upserts spans on `(tenant, trace, span)` and queues each distinct session with
 /// `last_span_at = now()`. A span that appears twice in `rows` keeps its last copy, because one
 /// `INSERT ... ON CONFLICT` cannot touch a row twice.
+///
+/// A pending snapshot (`glassflow.span.pending = true`) never replaces a finished span, neither
+/// one stored earlier nor one earlier in `rows`. A finished span replaces a pending one, and a
+/// pending snapshot replaces a pending one.
 pub async fn upsert_spans(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     rows: &[crate::otlp::SpanRow],
 ) -> sqlx::Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    let mut unique: Vec<&crate::otlp::SpanRow> = rows
-        .iter()
-        .rev()
-        .filter(|r| seen.insert((r.trace_id.as_str(), r.span_id.as_str())))
-        .collect();
-    unique.reverse();
+    // The last copy wins, except that a pending copy never replaces a finished one, the same
+    // rule the `ON CONFLICT` clause below applies against the stored span.
+    let mut at: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut unique: Vec<&crate::otlp::SpanRow> = Vec::new();
+    for r in rows {
+        match at.get(&(r.trace_id.as_str(), r.span_id.as_str())) {
+            Some(&i) => {
+                if !is_pending(r) || is_pending(unique[i]) {
+                    unique[i] = r;
+                }
+            }
+            None => {
+                at.insert((r.trace_id.as_str(), r.span_id.as_str()), unique.len());
+                unique.push(r);
+            }
+        }
+    }
     // A fixed lock order, so two concurrent requests over the same spans cannot deadlock.
     unique.sort_unstable_by(|a, b| (&a.trace_id, &a.span_id).cmp(&(&b.trace_id, &b.span_id)));
 
@@ -534,7 +620,9 @@ pub async fn upsert_spans(
              name = EXCLUDED.name, kind = EXCLUDED.kind, start_time = EXCLUDED.start_time, \
              end_time = EXCLUDED.end_time, status_code = EXCLUDED.status_code, \
              status_message = EXCLUDED.status_message, resource = EXCLUDED.resource, \
-             attributes = EXCLUDED.attributes, events = EXCLUDED.events, received_at = now()",
+             attributes = EXCLUDED.attributes, events = EXCLUDED.events, received_at = now() \
+             WHERE (EXCLUDED.attributes -> 'glassflow.span.pending') IS DISTINCT FROM 'true'::jsonb \
+             OR (spans.attributes -> 'glassflow.span.pending') IS NOT DISTINCT FROM 'true'::jsonb",
         );
         q.build().execute(&mut **tx).await?;
     }

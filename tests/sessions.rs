@@ -5,9 +5,13 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use common::{create_tenant_key, send, test_router, test_state_with};
+use lore::embed::{Embedder, HashEmbedder};
 use lore::http::AppState;
 use lore::search::{SearchQuery, search};
 use lore::sessions::{dequeue_if_unchanged, process_due_sessions};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -263,4 +267,129 @@ async fn a_session_of_pending_spans_only_is_not_indexed(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(documents, 0);
+}
+
+/// A `HashEmbedder` that counts the texts it is asked to embed.
+struct Counting {
+    texts: AtomicUsize,
+}
+
+impl Embedder for Counting {
+    fn name(&self) -> &str {
+        "hash"
+    }
+
+    fn embed_documents(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+        HashEmbedder.embed_documents(texts)
+    }
+
+    fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        HashEmbedder.embed_query(text)
+    }
+}
+
+/// A session of `turns` chat spans, each with about 4000 characters of text, so that every few
+/// turns make a chunk of their own.
+fn long_session(turns: usize) -> String {
+    let spans: Vec<serde_json::Value> = (0..turns)
+        .map(|n| {
+            let filler = |w: &str| format!("{w} ").repeat(300);
+            serde_json::json!({
+                "traceId": "5b8efff798038103d269b633813fc60c",
+                "spanId": format!("b1b2c3d4e5f6{n:04x}"),
+                "name": "chat claude-opus-5-5",
+                "kind": 1,
+                "startTimeUnixNano": format!("{}", 1_791_450_000_000_000_000_u64 + n as u64 * 1_000_000_000),
+                "endTimeUnixNano": format!("{}", 1_791_450_000_500_000_000_u64 + n as u64 * 1_000_000_000),
+                "attributes": [
+                    { "key": "session.id", "value": { "stringValue": SESSION_ID } },
+                    { "key": "gen_ai.operation.name", "value": { "stringValue": "chat" } },
+                    { "key": "input.value", "value": { "stringValue": format!("sentinel{n}q {}", filler("ask")) } },
+                    { "key": "output.value", "value": { "stringValue": format!("sentinel{n}a {}", filler("reply")) } },
+                ],
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "resourceSpans": [{
+            "resource": { "attributes": [
+                { "key": "service.name", "value": { "stringValue": "claude-code" } }
+            ] },
+            "scopeSpans": [{ "scope": { "name": "t" }, "spans": spans }],
+        }]
+    })
+    .to_string()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_grown_session_embeds_only_new_or_changed_chunks(pool: PgPool) {
+    let mut env = Env::new(pool, 0).await;
+    let counter = Arc::new(Counting {
+        texts: AtomicUsize::new(0),
+    });
+    env.state.embedder = counter.clone();
+    env.router = test_router(env.state.clone());
+    let embedded = || counter.texts.load(Ordering::SeqCst);
+    let stored = |env: &Env| {
+        let pool = env.state.pool.clone();
+        let tenant = env.tenant;
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT c.text, c.embedding::text FROM chunks c JOIN documents d ON d.id = c.document_id
+                 WHERE d.tenant_id = $1 AND d.kind = 'session' ORDER BY c.text",
+            )
+            .bind(tenant)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    env.post(&long_session(8)).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let first_chunks = stored(&env).await.len();
+    assert!(first_chunks >= 4, "{first_chunks} chunks");
+    assert_eq!(
+        embedded(),
+        first_chunks,
+        "the first index embeds every chunk"
+    );
+
+    // One more turn: the header and the last chunk change, the chunks between them do not.
+    env.post(&long_session(9)).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    let after = stored(&env).await;
+    let second_run = embedded() - first_chunks;
+    assert!(after.len() > first_chunks, "{} chunks", after.len());
+    assert!(second_run >= 1, "something changed");
+    assert!(
+        second_run <= 3 && second_run < after.len(),
+        "{second_run} of {} chunks were embedded again",
+        after.len()
+    );
+
+    // Every turn is still found, and the stored vectors are the ones a full index would make.
+    for n in 0..9 {
+        let hits = env.sessions_found(&format!("sentinel{n}q")).await;
+        assert!(
+            hits.iter()
+                .any(|h| h.text.contains(&format!("sentinel{n}q"))),
+            "turn {n} not found"
+        );
+    }
+    sqlx::query("DELETE FROM documents WHERE tenant_id = $1 AND kind = 'session'")
+        .bind(env.tenant)
+        .execute(&env.state.pool)
+        .await
+        .unwrap();
+    env.post(&long_session(9)).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    assert_eq!(stored(&env).await, after);
+
+    // The same text again embeds nothing.
+    let before_noop = embedded();
+    env.post(&long_session(9)).await;
+    process_due_sessions(&env.state, 20).await.unwrap();
+    assert_eq!(embedded(), before_noop);
 }

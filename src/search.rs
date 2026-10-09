@@ -24,6 +24,10 @@ pub const MAX_K: usize = 50;
 /// The longest accepted query, in characters.
 pub const MAX_QUERY_CHARS: usize = 2000;
 /// Document kinds (`documents.kind`), as the migration lists them.
+/// A hit carries at most this many bytes of `metadata.path`. The documents API refuses a longer
+/// path, and a document stored before that limit has its path cut here.
+pub const MAX_PATH_BYTES: usize = 2048;
+
 pub const DOCUMENT_KINDS: [&str; 4] = ["code", "doc", "session", "note"];
 
 /// A snippet is the first lines of a chunk.
@@ -57,7 +61,7 @@ pub struct Hit {
     pub title: String,
     /// A rendered web link for repo files whose source has a template, else `documents.uri`.
     pub uri: Option<String>,
-    /// `documents.metadata->>'path'`: only repo files have one.
+    /// `documents.metadata->>'path'` cut to `MAX_PATH_BYTES`: repo files and documents that set it.
     pub path: Option<String>,
     /// The session id for `session` hits, `None` for every other kind.
     pub external_id: Option<String>,
@@ -90,9 +94,10 @@ struct HitRow {
 
 impl HitRow {
     fn into_hit(self, score: f64) -> Hit {
+        let path = self.path.map(|p| cut_bytes(p, MAX_PATH_BYTES));
         let rendered = match (
             self.template.as_deref(),
-            self.path.as_deref(),
+            path.as_deref(),
             self.commit.as_deref(),
             self.start_line,
             self.end_line,
@@ -111,7 +116,7 @@ impl HitRow {
             kind: self.kind,
             title: self.title,
             uri: rendered.or(self.doc_uri),
-            path: self.path,
+            path,
             external_id: self.external_id,
             start_line: self.start_line,
             end_line: self.end_line,
@@ -120,6 +125,18 @@ impl HitRow {
             score,
         }
     }
+}
+
+/// `s` cut to at most `max` bytes, on a char boundary.
+fn cut_bytes(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 /// The first 40 lines of `text`, joined by `\n`. The HTTP route and the MCP tools both use it.
@@ -175,7 +192,7 @@ pub async fn search(
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let rows: Vec<HitRow> = sqlx::query_as(
         "SELECT c.id, c.document_id, s.name AS source, d.kind, d.title, d.uri AS doc_uri,
-                d.metadata->>'path' AS path,
+                left(d.metadata->>'path', 2048) AS path,
                 CASE WHEN d.kind = 'session' THEN d.external_id END AS external_id,
                 d.metadata->>'commit' AS commit,
                 s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text
