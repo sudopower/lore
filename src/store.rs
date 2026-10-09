@@ -120,6 +120,97 @@ pub async fn list_sources(
     .await
 }
 
+/// A source with its document count, for `list_sources` in the MCP tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct SourceSummary {
+    pub name: String,
+    pub kind: String,
+    pub indexed_commit: Option<String>,
+    pub documents: i64,
+}
+
+/// The tenant's sources with how many documents each holds, ordered like [`list_sources`].
+pub async fn list_source_summaries(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> sqlx::Result<Vec<SourceSummary>> {
+    sqlx::query_as(
+        "SELECT s.name, s.kind, s.indexed_commit, count(d.id) AS documents
+         FROM sources s
+         LEFT JOIN documents d ON d.source_id = s.id AND d.tenant_id = s.tenant_id
+         WHERE s.tenant_id = $1
+         GROUP BY s.id
+         ORDER BY s.kind, s.name",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// What `document_text` knows about a document besides its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct DocumentRow {
+    pub id: Uuid,
+    pub source_id: Uuid,
+    /// The source name.
+    pub source: String,
+    /// The document kind (`code`, `doc`, `session`, `note`).
+    pub kind: String,
+    pub title: String,
+    pub uri: Option<String>,
+    /// `metadata->>'path'`: only repo files have one.
+    pub path: Option<String>,
+}
+
+/// The document and its chunks joined by `\n` in `ord` order, or `None` when the id is unknown or
+/// belongs to another tenant. The text is not capped; callers cut it to their own limit.
+///
+/// A database error is logged and also gives `None`: callers see "not found" rather than a
+/// distinct failure, which keeps the signature simple for the MCP tool and the later reader of
+/// the same text.
+pub async fn document_text(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    document_id: Uuid,
+) -> Option<(DocumentRow, String)> {
+    match load_document(pool, tenant_id, document_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::error!(error = %e, %document_id, "reading a document failed");
+            None
+        }
+    }
+}
+
+async fn load_document(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    document_id: Uuid,
+) -> sqlx::Result<Option<(DocumentRow, String)>> {
+    let row: Option<DocumentRow> = sqlx::query_as(
+        "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri,
+                d.metadata->>'path' AS path
+         FROM documents d
+         JOIN sources s ON s.id = d.source_id
+         WHERE d.id = $1 AND d.tenant_id = $2",
+    )
+    .bind(document_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let chunks: Vec<String> = sqlx::query_scalar(
+        "SELECT text FROM chunks WHERE document_id = $1 AND tenant_id = $2 ORDER BY ord",
+    )
+    .bind(document_id)
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some((row, chunks.join("\n"))))
+}
+
 /// Records the commit a repo source has been indexed up to. `source_id` comes from a `Source` the
 /// caller already fetched for its tenant.
 pub async fn set_indexed_commit(pool: &PgPool, source_id: Uuid, sha: &str) -> sqlx::Result<()> {

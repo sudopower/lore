@@ -26,6 +26,9 @@ pub const MAX_QUERY_CHARS: usize = 2000;
 /// Document kinds (`documents.kind`), as the migration lists them.
 pub const DOCUMENT_KINDS: [&str; 4] = ["code", "doc", "session", "note"];
 
+/// A snippet is the first lines of a chunk.
+const SNIPPET_LINES: usize = 40;
+
 /// Rows taken from each branch before fusion.
 const BRANCH_LIMIT: i64 = 50;
 /// The `k` constant of Reciprocal Rank Fusion.
@@ -113,6 +116,14 @@ impl HitRow {
             score,
         }
     }
+}
+
+/// The first 40 lines of `text`, joined by `\n`. The HTTP route and the MCP tools both use it.
+pub fn snippet(text: &str) -> String {
+    text.lines()
+        .take(SNIPPET_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Hybrid search over the tenant's chunks. Returns at most `k` hits, best first. Another
@@ -374,6 +385,17 @@ mod tests {
     use super::*;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn snippet_is_the_first_40_lines() {
+        let text: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let s = snippet(&text);
+        assert_eq!(s.lines().count(), 40);
+        assert!(s.starts_with("line 1\n"));
+        assert!(s.ends_with("line 40"));
+        assert_eq!(snippet("a\nb"), "a\nb");
+        assert_eq!(snippet(""), "");
+    }
 
     #[test]
     fn k_is_clamped_to_1_through_50() {

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::middleware::from_fn_with_state;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -15,6 +16,7 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
 use crate::llm::{Llm, Models};
+use crate::mcp;
 use crate::repo::SourceLocks;
 use crate::web;
 
@@ -40,7 +42,12 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     // The limit is on the bundle route only: other routes keep axum's own defaults.
     let bundle_limit = usize::try_from(state.config.max_bundle_bytes).unwrap_or(usize::MAX);
+    // MCP clients get 401/403 from the middleware before rmcp sees the request.
+    let mcp = Router::new()
+        .nest_service("/mcp", mcp::service(state.clone()))
+        .layer(from_fn_with_state(state.clone(), mcp::require_caller));
     Router::new()
+        .merge(mcp)
         .route("/", get(web::index))
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))

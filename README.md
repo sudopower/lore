@@ -60,9 +60,10 @@ cargo build --release && export PATH="$PWD/target/release:$PATH"
 curl -s $LORE_URL/healthz            # {"status":"ok","db":"ok"}
 scripts/smoke.sh m1                  # last line: SMOKE M1 OK
 scripts/smoke.sh m2                  # last line: SMOKE M2 OK
+scripts/mcp_smoke.sh                 # last line: MCP SMOKE OK
 ```
 
-`scripts/smoke.sh <stage>` (`m1`, `m2`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`.
+`scripts/smoke.sh <stage>` (`m1`, `m2`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq` and `git` on the path. It creates fresh tenants on each run. It also works against `make run`. `scripts/mcp_smoke.sh` checks the MCP endpoint (see [Use lore from agents](#use-lore-from-agents)); it needs `curl` as well.
 
 ## Configuration
 
@@ -89,6 +90,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_OPENAI_BASE_URL` | unset | Base URL of the OpenAI-compatible server, for example `http://localhost:8081/v1` (lore calls `<base>/chat/completions`). Required when `LORE_LLM=openai` |
 | `LORE_OPENAI_MODEL` | unset | Model name sent to the OpenAI-compatible server, used for both answer modes with no effort. Required when `LORE_LLM=openai` |
 | `LORE_OPENAI_API_KEY` | unset | Bearer token for the OpenAI-compatible server. Optional |
+| `LORE_MCP_ALLOWED_HOSTS` | unset | Comma-separated `Host` values the MCP endpoint (`/mcp`) accepts, for example `lore.example.com,lore.lore.svc:8080`. Unset means any host is accepted, which is what you want behind Caddy or a cluster Service; the bearer key is the protection. When set, a request with another `Host` header gets a 403 |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
@@ -232,3 +234,26 @@ curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"has
 The key stays in the browser's local storage (under `lore.key`) and is sent only to this server, as `Authorization: Bearer <key>`. If the browser blocks local storage, the page still works and you paste the key again on each visit. The answer shows with numbered citations that link to the sources; a source is a link only when its URL starts with `http://` or `https://`. The `deep` option is enabled only when `GET /v1/info` lists `deep` in `modes`.
 
 The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js` under node when node is installed.
+
+## Use lore from agents
+
+lore serves MCP (the Model Context Protocol) over streamable HTTP at `/mcp`, so an agent can search and ask questions about what you indexed. The endpoint is stateless and answers with plain JSON. It takes the same `lk_` tenant keys as the REST API, sent as `Authorization: Bearer <key>`, and the key needs the `read` scope. A missing or bad key is a 401 and a key without `read` is a 403, both with the usual `{"error": "..."}` body. Every tool sees only the key's own tenant.
+
+Claude Code:
+
+```bash
+claude mcp add --transport http lore "$LORE_URL/mcp" --header "Authorization: Bearer $LORE_KEY"
+```
+
+Tares agents: register lore in the Tares MCP registry as a streamable HTTP server, with the URL `$LORE_URL/mcp` and the same `Authorization: Bearer <key>` header. The tools then appear to the agent as `lore__search`, `lore__ask`, `lore__get_document` and `lore__list_sources`.
+
+Any other MCP client that speaks streamable HTTP works the same way.
+
+| Tool | Input | Returns |
+| --- | --- | --- |
+| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`) | One text item: a JSON array of hits with `document_id`, `path`, `start_line`, `end_line`, `kind`, `title`, `source`, `score` and `snippet` (the first 40 lines) |
+| `ask` | `question`, `mode` (`fast`, the default; `deep` is a tool error until deep mode exists) | Two text items: the answer followed by a `Sources:` list with one line per citation, then the full `/v1/ask` response as JSON |
+| `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
+| `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
+
+`scripts/mcp_smoke.sh` runs the whole exchange against a server: `LORE_URL=http://localhost:8080 LORE_ADMIN_TOKEN=dev-admin scripts/mcp_smoke.sh` prints the sorted tool names, the `src/billing/plans.rs` hit and `MCP SMOKE OK`. By default `/mcp` accepts any `Host` header; set `LORE_MCP_ALLOWED_HOSTS` to restrict it.
