@@ -1,0 +1,13 @@
+# Rehearsal override for `make prod-local`: Caddy on 8081 and 8443 with its internal CA,
+# lore with the fake model and the hash embedder (no API key, no model download).
+services:
+  caddy:
+    ports: !override
+      - "8081:80"
+      - "8443:443"
+    environment:
+      LORE_DOMAIN: localhost
+  lore:
+    environment:
+      LORE_LLM: fake
+      LORE_EMBEDDER: hash

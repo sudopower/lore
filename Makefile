@@ -5,7 +5,7 @@ GEN = deploy/k8s/overlays/generated
 DATABASE_URL ?= postgres://lore:lore@localhost:5434/lore
 export DATABASE_URL
 
-.PHONY: db-up run test lint check image kind-up kind-load kind-secret kind-deploy kind-rollback kind-logs kind-delete
+.PHONY: db-up run test lint check image kind-up kind-load kind-secret kind-deploy kind-rollback kind-logs kind-delete prod-local prod-local-backup prod-local-down deploy-prod
 
 db-up:
 	docker compose up -d --wait db
@@ -106,3 +106,33 @@ kind-delete:
 	@: $(CHECK_NS)
 	@case "$$NS" in *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|"") echo "kind-delete is for dev namespaces only"; exit 1 ;; lore-dev-?*) ;; *) echo "kind-delete is for dev namespaces only"; exit 1 ;; esac
 	kubectl $(KCTX) delete namespace $(NS) --wait=false
+
+# Rehearsal of the production stack on this machine (docs/self-hosting.md): Caddy on
+# 8081 and 8443, the fake model, the hash embedder. deploy/.env.prod holds random local values.
+COMPOSE_LOCAL = cd deploy && VERSION=$(VERSION) LORE_DOMAIN=localhost docker compose -p lore-local --env-file .env.prod -f compose.prod.yml -f compose.local.yml
+
+prod-local:
+	$(MAKE) image VERSION=$(VERSION)
+	@test -f deploy/.env.prod || { umask 077; printf 'POSTGRES_PASSWORD=%s\nLORE_ADMIN_TOKEN=%s\n' "$$(openssl rand -hex 16)" "$$(openssl rand -hex 24)" > deploy/.env.prod; echo "created deploy/.env.prod"; }
+	$(COMPOSE_LOCAL) up -d --wait
+	@i=0; until body=$$(curl -sk https://localhost:8443/healthz) && echo "$$body" | grep -q '"ok"'; do i=$$((i+2)); if [ $$i -gt 120 ]; then echo "healthz did not answer ok within 120s"; exit 1; fi; sleep 2; done; echo "$$body"
+	@code=$$(curl -sk -o /dev/null -w '%{http_code}' -X POST https://localhost:8443/mcp -H 'Content-Type: application/json' -d '{}'); echo "POST /mcp -> $$code"; [ "$$code" = 401 ] || { echo "expected 401: MCP must be reachable through Caddy"; exit 1; }
+	@code=$$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/v1/admin/tenants); echo "GET /v1/admin/tenants -> $$code"; [ "$$code" = 403 ] || { echo "expected 403: Caddy must block the admin API"; exit 1; }
+
+prod-local-backup:
+	@set -e; f=$$($(COMPOSE_LOCAL) exec -T backup bash -c 'set -o pipefail; f=/backups/lore-now-$$(date +%s).sql.gz; pg_dump -h db -U lore lore | gzip > $$f && basename $$f'); \
+	echo "backups/$$f"; \
+	gzip -dc deploy/backups/$$f | grep -q 'CREATE TABLE public.chunks' || { echo "dump has no chunks table"; exit 1; }
+
+prod-local-down:
+	$(COMPOSE_LOCAL) down -v
+
+# Kiran only. No factory station runs this.
+deploy-prod:
+	@test -n "$(HOST)" -a -n "$(LORE_DOMAIN)" -a "$(VERSION)" != dev || { echo "usage: make deploy-prod HOST=root@<ip> LORE_DOMAIN=<domain> VERSION=<tag>"; exit 1; }
+	docker build --platform linux/arm64 --build-arg VERSION=$(VERSION) -t lore:$(VERSION) .
+	docker save lore:$(VERSION) | gzip | ssh $(HOST) 'gunzip | docker load'
+	ssh $(HOST) 'mkdir -p /opt/lore/backups && test -f /opt/lore/.env.prod' || { echo "create /opt/lore/.env.prod first, see docs/self-hosting.md"; exit 1; }
+	scp deploy/compose.prod.yml deploy/Caddyfile $(HOST):/opt/lore/
+	ssh $(HOST) 'cd /opt/lore && VERSION=$(VERSION) LORE_DOMAIN=$(LORE_DOMAIN) docker compose --env-file .env.prod -f compose.prod.yml up -d --wait'
+	curl -s https://$(LORE_DOMAIN)/healthz
