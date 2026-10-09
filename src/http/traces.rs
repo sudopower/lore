@@ -5,7 +5,9 @@ use axum::extract::State;
 use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceResponse,
+};
 use prost::Message;
 use serde::Serialize;
 
@@ -16,9 +18,28 @@ use crate::http::repos::is_length_limit;
 use crate::otlp::{self, JSON, PROTOBUF};
 use crate::store;
 
-/// The JSON reply to a JSON request: `{}`.
+/// The JSON reply to a JSON request: `{}`, or `partialSuccess` when spans were left out.
 #[derive(Serialize)]
-struct Empty {}
+struct JsonReply {
+    #[serde(rename = "partialSuccess", skip_serializing_if = "Option::is_none")]
+    partial_success: Option<JsonPartialSuccess>,
+}
+
+/// OTLP JSON writes an int64 as a string.
+#[derive(Serialize)]
+struct JsonPartialSuccess {
+    #[serde(rename = "rejectedSpans")]
+    rejected_spans: String,
+    #[serde(rename = "errorMessage")]
+    error_message: String,
+}
+
+fn rejected_message(rejected: usize) -> String {
+    format!(
+        "{rejected} span(s) not stored: a trace id must be 16 bytes, a span id 8 bytes, \
+         and a parent span id empty or 8 bytes"
+    )
+}
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
@@ -45,27 +66,41 @@ pub async fn post_traces(
 
     // Unzipping and parsing are CPU work, so they stay off the async workers.
     let media = otlp::media_type(&content_type);
-    let rows = tokio::task::spawn_blocking(move || {
+    let converted = tokio::task::spawn_blocking(move || {
         let req = otlp::decode(&content_type, content_encoding.as_deref(), &bytes)?;
-        Ok::<_, AppError>(otlp::to_rows(&req))
+        otlp::to_rows(&req)
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("decode task failed")))??;
 
     store::ensure_source(&state.pool, caller.tenant_id, "traces", "otlp", None).await?;
     let mut tx = state.pool.begin().await?;
-    store::upsert_spans(&mut tx, caller.tenant_id, &rows).await?;
+    store::upsert_spans(&mut tx, caller.tenant_id, &converted.rows).await?;
     tx.commit().await?;
 
+    let rejected = converted.rejected;
+    if rejected > 0 {
+        tracing::warn!(tenant_id = %caller.tenant_id, rejected, "spans without valid ids were not stored");
+    }
+
     let (content_type, payload) = if media == PROTOBUF {
-        (
-            PROTOBUF,
-            ExportTraceServiceResponse::default().encode_to_vec(),
-        )
+        let reply = ExportTraceServiceResponse {
+            partial_success: (rejected > 0).then(|| ExportTracePartialSuccess {
+                rejected_spans: rejected as i64,
+                error_message: rejected_message(rejected),
+            }),
+        };
+        (PROTOBUF, reply.encode_to_vec())
     } else {
+        let reply = JsonReply {
+            partial_success: (rejected > 0).then(|| JsonPartialSuccess {
+                rejected_spans: rejected.to_string(),
+                error_message: rejected_message(rejected),
+            }),
+        };
         (
             JSON,
-            serde_json::to_vec(&Empty {}).map_err(|e| AppError::Internal(e.into()))?,
+            serde_json::to_vec(&reply).map_err(|e| AppError::Internal(e.into()))?,
         )
     };
     let mut res = (StatusCode::OK, payload).into_response();

@@ -4,6 +4,7 @@
 //! `SpanRow` per span, with `AnyValue` attributes mapped to plain JSON.
 
 use std::io::Read;
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -16,11 +17,21 @@ use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 use opentelemetry_proto::tonic::trace::v1::{Span, Status};
 use prost::Message;
 use serde_json::{Map, Number, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 
 /// A request may expand to at most this many bytes when gunzipped.
 pub const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The rows of one request may hold at most this many bytes of resource, attributes and events
+/// (the resource counted once per span). Without it a small body with a large resource and many
+/// spans multiplies the resource far beyond the body.
+pub const MAX_ROW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A session id longer than this is cut and gets a hash of the whole id, so it still fits a
+/// btree key.
+pub const MAX_SESSION_ID_BYTES: usize = 512;
 
 /// Strings longer than this are cut.
 pub const MAX_STRING_BYTES: usize = 64 * 1024;
@@ -44,7 +55,7 @@ pub struct SpanRow {
     pub end_time: DateTime<Utc>,
     pub status_code: String,
     pub status_message: Option<String>,
-    pub resource: Value,
+    pub resource: Arc<Value>,
     pub attributes: Value,
     pub events: Value,
 }
@@ -110,28 +121,55 @@ fn gunzip(body: &[u8]) -> Result<Vec<u8>, AppError> {
     Ok(out)
 }
 
-/// One row per span. A span without a trace id or a span id cannot be keyed, so it is skipped.
-pub fn to_rows(req: &ExportTraceServiceRequest) -> Vec<SpanRow> {
+/// What `to_rows` made of a request.
+#[derive(Debug, PartialEq)]
+pub struct Converted {
+    pub rows: Vec<SpanRow>,
+    /// Spans left out: an id that is missing or not 16 bytes (trace) or 8 bytes (span, parent).
+    pub rejected: usize,
+}
+
+/// One row per valid span. A span whose trace id is not 16 bytes, whose span id is not 8 bytes, or
+/// whose parent id is neither empty nor 8 bytes cannot be keyed, so it is counted in `rejected`.
+/// More than `MAX_ROW_BYTES` of row data in one request is `PayloadTooLarge`.
+pub fn to_rows(req: &ExportTraceServiceRequest) -> Result<Converted, AppError> {
     let mut rows = Vec::new();
+    let mut rejected = 0;
+    let mut total: u64 = 0;
     for rs in &req.resource_spans {
-        let resource = rs
-            .resource
-            .as_ref()
-            .map(|r| attributes_json(&r.attributes))
-            .unwrap_or_else(|| Value::Object(Map::new()));
+        let resource = Arc::new(
+            rs.resource
+                .as_ref()
+                .map(|r| attributes_json(&r.attributes))
+                .unwrap_or_else(|| Value::Object(Map::new())),
+        );
+        let resource_bytes = json_len(&resource);
         for ss in &rs.scope_spans {
             for span in &ss.spans {
-                if span.trace_id.is_empty() || span.span_id.is_empty() {
+                let valid = span.trace_id.len() == 16
+                    && span.span_id.len() == 8
+                    && matches!(span.parent_span_id.len(), 0 | 8);
+                if !valid {
+                    rejected += 1;
                     continue;
                 }
-                rows.push(span_row(span, &resource));
+                let row = span_row(span, &resource);
+                total += resource_bytes + json_len(&row.attributes) + json_len(&row.events);
+                if total > MAX_ROW_BYTES {
+                    return Err(AppError::PayloadTooLarge);
+                }
+                rows.push(row);
             }
         }
     }
-    rows
+    Ok(Converted { rows, rejected })
 }
 
-fn span_row(span: &Span, resource: &Value) -> SpanRow {
+fn json_len(value: &Value) -> u64 {
+    serde_json::to_vec(value).map_or(0, |b| b.len() as u64)
+}
+
+fn span_row(span: &Span, resource: &Arc<Value>) -> SpanRow {
     let trace_id = hex::encode(&span.trace_id);
     let attributes = attributes_json(&span.attributes);
     let session_id = session_id(&attributes, resource, &trace_id);
@@ -151,7 +189,7 @@ fn span_row(span: &Span, resource: &Value) -> SpanRow {
         end_time: nanos_to_time(span.end_time_unix_nano),
         status_code,
         status_message,
-        resource: resource.clone(),
+        resource: Arc::clone(resource),
         attributes,
         events: Value::Array(span.events.iter().map(event_json).collect()),
     }
@@ -167,10 +205,25 @@ fn session_id(span_attributes: &Value, resource: &Value, trace_id: &str) -> Stri
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    non_empty(span_attributes, "session.id")
+    let id = non_empty(span_attributes, "session.id")
         .or_else(|| non_empty(span_attributes, "gen_ai.conversation.id"))
         .or_else(|| non_empty(resource, "session.id"))
-        .unwrap_or_else(|| trace_id.to_string())
+        .unwrap_or_else(|| trace_id.to_string());
+    bound_session_id(id)
+}
+
+/// A session id over `MAX_SESSION_ID_BYTES` becomes its first part, `~`, and 16 hex characters of
+/// the SHA-256 of the whole id, so two long ids that share a start stay apart.
+fn bound_session_id(id: String) -> String {
+    if id.len() <= MAX_SESSION_ID_BYTES {
+        return id;
+    }
+    let mut cut = MAX_SESSION_ID_BYTES - 17;
+    while !id.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let digest = hex::encode(Sha256::digest(id.as_bytes()));
+    format!("{}~{}", &id[..cut], &digest[..16])
 }
 
 /// The enum name without its `SPAN_KIND_` prefix, for example `INTERNAL`.
@@ -308,8 +361,12 @@ mod tests {
         }
     }
 
+    fn rows_of(req: &ExportTraceServiceRequest) -> Vec<SpanRow> {
+        to_rows(req).unwrap().rows
+    }
+
     fn session_of(resource: Vec<KeyValue>, attrs: Vec<KeyValue>) -> String {
-        to_rows(&request(resource, span(attrs)))
+        rows_of(&request(resource, span(attrs)))
             .remove(0)
             .session_id
     }
@@ -367,7 +424,7 @@ mod tests {
         assert_eq!(body.len() % 3, 0);
 
         // Attribute values go through the same cut.
-        let rows = to_rows(&request(vec![], span(vec![s("input.value", &long)])));
+        let rows = rows_of(&request(vec![], span(vec![s("input.value", &long)])));
         let v = rows[0].attributes["input.value"].as_str().unwrap();
         assert!(v.ends_with(TRUNCATED_SUFFIX));
     }
@@ -427,7 +484,7 @@ mod tests {
             attributes: vec![s("exception.type", "ToolError")],
             ..Default::default()
         }];
-        let row = to_rows(&request(vec![s("service.name", "claude-code")], sp)).remove(0);
+        let row = rows_of(&request(vec![s("service.name", "claude-code")], sp)).remove(0);
         assert_eq!(row.trace_id, "ab".repeat(16));
         assert_eq!(row.span_id, "0102030405060708");
         assert_eq!(row.parent_span_id, None);
@@ -435,7 +492,7 @@ mod tests {
         assert_eq!(row.status_code, "ERROR");
         assert_eq!(row.status_message.as_deref(), Some("bad"));
         assert_eq!((row.end_time - row.start_time).num_seconds(), 300);
-        assert_eq!(row.resource, json!({"service.name": "claude-code"}));
+        assert_eq!(*row.resource, json!({"service.name": "claude-code"}));
         assert_eq!(
             row.events,
             json!([{
@@ -447,10 +504,74 @@ mod tests {
     }
 
     #[test]
-    fn spans_without_ids_are_skipped() {
-        let mut sp = span(vec![]);
-        sp.span_id = vec![];
-        assert!(to_rows(&request(vec![], sp)).is_empty());
+    fn spans_without_valid_ids_are_rejected_and_counted() {
+        let bad = |edit: fn(&mut Span)| {
+            let mut sp = span(vec![]);
+            edit(&mut sp);
+            to_rows(&request(vec![], sp)).unwrap()
+        };
+        for converted in [
+            bad(|sp| sp.span_id = vec![]),
+            bad(|sp| sp.trace_id = vec![]),
+            bad(|sp| sp.trace_id = vec![1; 8000]),
+            bad(|sp| sp.span_id = vec![1; 9]),
+            bad(|sp| sp.parent_span_id = vec![1; 3]),
+        ] {
+            assert!(converted.rows.is_empty());
+            assert_eq!(converted.rejected, 1);
+        }
+        let ok = bad(|sp| sp.parent_span_id = vec![1; 8]);
+        assert_eq!((ok.rows.len(), ok.rejected), (1, 0));
+    }
+
+    #[test]
+    fn a_long_session_id_is_bounded_and_stays_distinct() {
+        let a = format!("{}a", "x".repeat(600));
+        let b = format!("{}b", "x".repeat(600));
+        let (a, b) = (
+            session_of(vec![], vec![s("session.id", &a)]),
+            session_of(vec![], vec![s("session.id", &b)]),
+        );
+        assert!(a.len() <= MAX_SESSION_ID_BYTES && b.len() <= MAX_SESSION_ID_BYTES);
+        assert_ne!(a, b);
+        let short = "y".repeat(MAX_SESSION_ID_BYTES);
+        assert_eq!(session_of(vec![], vec![s("session.id", &short)]), short);
+    }
+
+    #[test]
+    fn keys_are_cleaned_like_values() {
+        let long_key = "k".repeat(MAX_STRING_BYTES + 1);
+        let attrs = attributes_json(&[s(&long_key, "v"), s("a\0b", "v")]);
+        let keys: Vec<&String> = attrs.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter()
+                .all(|k| k.len() <= MAX_STRING_BYTES + TRUNCATED_SUFFIX.len())
+        );
+        assert!(attrs.get("a\u{FFFD}b").is_some());
+        assert!(keys.iter().any(|k| k.ends_with(TRUNCATED_SUFFIX)));
+    }
+
+    #[test]
+    fn row_data_is_bounded_per_request() {
+        // One 1 MiB resource shared by 70 spans is 70 MiB of row data, past the 64 MiB cap.
+        let big = "r".repeat(MAX_STRING_BYTES);
+        let resource: Vec<KeyValue> = (0..16).map(|i| s(&format!("k{i}"), &big)).collect();
+        let spans = |n: usize| -> ExportTraceServiceRequest {
+            let mut req = request(resource.clone(), span(vec![]));
+            let one = req.resource_spans[0].scope_spans[0].spans[0].clone();
+            req.resource_spans[0].scope_spans[0].spans = (0..n)
+                .map(|i| Span {
+                    span_id: (i as u64 + 1).to_be_bytes().to_vec(),
+                    ..one.clone()
+                })
+                .collect();
+            req
+        };
+        assert_eq!(to_rows(&spans(60)).unwrap().rows.len(), 60);
+        assert!(matches!(
+            to_rows(&spans(70)),
+            Err(AppError::PayloadTooLarge)
+        ));
     }
 
     const HEX_JSON: &str = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
@@ -463,7 +584,7 @@ mod tests {
     #[test]
     fn json_ids_are_hex_and_enums_are_numeric() {
         let req = decode("application/json", None, HEX_JSON.as_bytes()).unwrap();
-        let row = to_rows(&req).remove(0);
+        let row = rows_of(&req).remove(0);
         assert_eq!(row.trace_id, "5b8efff798038103d269b633813fc60c");
         assert_eq!(row.span_id, "0102030405060708");
         assert_eq!(row.parent_span_id.as_deref(), Some("a1a2a3a4a5a6a7a8"));
@@ -479,7 +600,7 @@ mod tests {
         let req = decode("application/json", None, HEX_JSON.as_bytes()).unwrap();
         let bytes = req.encode_to_vec();
         let back = decode("application/x-protobuf", None, &bytes).unwrap();
-        assert_eq!(to_rows(&back), to_rows(&req));
+        assert_eq!(rows_of(&back), rows_of(&req));
 
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&bytes).unwrap();
@@ -490,7 +611,7 @@ mod tests {
             &zipped,
         )
         .unwrap();
-        assert_eq!(to_rows(&back), to_rows(&req));
+        assert_eq!(rows_of(&back), rows_of(&req));
     }
 
     #[test]

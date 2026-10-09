@@ -421,6 +421,8 @@ pub async fn upsert_spans(
         .filter(|r| seen.insert((r.trace_id.as_str(), r.span_id.as_str())))
         .collect();
     unique.reverse();
+    // A fixed lock order, so two concurrent requests over the same spans cannot deadlock.
+    unique.sort_unstable_by(|a, b| (&a.trace_id, &a.span_id).cmp(&(&b.trace_id, &b.span_id)));
 
     for chunk in unique.chunks(SPAN_INSERT_CHUNK) {
         let mut q = sqlx::QueryBuilder::<Postgres>::new(
@@ -439,7 +441,7 @@ pub async fn upsert_spans(
                 .push_bind(r.end_time)
                 .push_bind(&r.status_code)
                 .push_bind(&r.status_message)
-                .push_bind(&r.resource)
+                .push_bind(r.resource.as_ref())
                 .push_bind(&r.attributes)
                 .push_bind(&r.events);
         });

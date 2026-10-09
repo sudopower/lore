@@ -107,8 +107,16 @@ async fn json_fixture_is_stored(pool: PgPool) {
     assert_eq!(sessions, vec!["sess-fixture-1".to_string()]);
 
     // The root: no parent, INTERNAL, five minutes long, the resource attributes stored.
-    let (parent, kind, secs, resource): (Option<String>, String, f64, Value) = sqlx::query_as(
-        "SELECT parent_span_id, kind, EXTRACT(EPOCH FROM end_time - start_time)::float8, resource
+    let (parent, kind, secs, resource, root_status, root_message): (
+        Option<String>,
+        String,
+        f64,
+        Value,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT parent_span_id, kind, EXTRACT(EPOCH FROM end_time - start_time)::float8, resource,
+                status_code, status_message
          FROM spans WHERE tenant_id = $1 AND name = 'claude_code.session'",
     )
     .bind(env.tenant)
@@ -118,6 +126,11 @@ async fn json_fixture_is_stored(pool: PgPool) {
     assert_eq!(parent, None);
     assert_eq!(kind, "INTERNAL");
     assert_eq!(secs, 300.0);
+    assert_eq!(root_status, "OK");
+    assert_eq!(
+        root_message, None,
+        "an empty status message is stored as NULL"
+    );
     assert_eq!(resource["service.name"], "claude-code");
     assert_eq!(resource["service.instance.id"], "fixture-host");
 
@@ -227,8 +240,21 @@ async fn protobuf_and_gzip_are_idempotent(pool: PgPool) {
 async fn a_resent_span_is_updated_in_place(pool: PgPool) {
     let env = Env::new(pool).await;
     assert_eq!(env.post_json(CLAUDE_CODE).await.status(), StatusCode::OK);
+    sqlx::query("UPDATE spans SET received_at = now() - interval '1 hour' WHERE tenant_id = $1")
+        .bind(env.tenant)
+        .execute(&env.pool)
+        .await
+        .unwrap();
     let changed = CLAUDE_CODE.replace("ripgrep exited with code 2", "changed message");
     assert_eq!(env.post_json(&changed).await.status(), StatusCode::OK);
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM spans WHERE tenant_id = $1 AND received_at < now() - interval '1 minute'",
+    )
+    .bind(env.tenant)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0, "a resent span gets a new received_at");
     let message: String = sqlx::query_scalar(
         "SELECT status_message FROM spans WHERE tenant_id = $1 AND name = 'execute_tool Grep'",
     )
@@ -449,4 +475,152 @@ async fn odd_but_valid_spans_are_stored(pool: PgPool) {
     assert_eq!(session, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f");
     assert!(big.ends_with("\u{2026}[truncated]"));
     assert_eq!(big.len(), 64 * 1024 + "\u{2026}[truncated]".len());
+}
+
+/// A JSON body with `spans` valid spans (ids 1..) that share one resource of `resource_attrs`
+/// attributes of 60,000 characters each.
+fn heavy_resource_body(resource_attrs: usize, spans: usize) -> String {
+    let big = "r".repeat(60_000);
+    let attrs: Vec<String> = (0..resource_attrs)
+        .map(|i| format!(r#"{{"key":"k{i}","value":{{"stringValue":"{big}"}}}}"#))
+        .collect();
+    let spans: Vec<String> = (1..=spans)
+        .map(|i| {
+            format!(
+                r#"{{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","spanId":"{i:016x}","name":"s",
+                "startTimeUnixNano":"1791450000000000000","endTimeUnixNano":"1791450001000000000"}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"resourceSpans":[{{"resource":{{"attributes":[{}]}},"scopeSpans":[{{"spans":[{}]}}]}}]}}"#,
+        attrs.join(","),
+        spans.join(",")
+    )
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_large_resource_shared_by_many_spans_is_a_413(pool: PgPool) {
+    let env = Env::new(pool).await;
+    // About 1 MB of body, but 20 resource attributes of 60 KB on each of 100 spans is 120 MB of rows.
+    let body = heavy_resource_body(20, 100);
+    assert!(body.len() < 2 * 1024 * 1024);
+    let res = env.post_json(&body).await;
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(env.span_count(env.tenant).await, 0);
+
+    // The same resource on a few spans is fine.
+    let res = env.post_json(&heavy_resource_body(20, 10)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(env.span_count(env.tenant).await, 10);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn spans_with_bad_ids_are_reported_and_the_rest_are_kept(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let long_trace = "ab".repeat(4000);
+    let body = format!(
+        r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[
+        {{"traceId":"{long_trace}","spanId":"1111111111111111","name":"bad trace id"}},
+        {{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","spanId":"22","name":"bad span id"}},
+        {{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","spanId":"3333333333333333","name":"good"}}
+        ]}}]}}]}}"#
+    );
+
+    let res = env.post_json(&body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let reply = body_json(res).await;
+    assert_eq!(reply["partialSuccess"]["rejectedSpans"], "2");
+    assert!(
+        reply["partialSuccess"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("2 span(s)")
+    );
+    assert_eq!(env.span_count(env.tenant).await, 1);
+
+    let res = env
+        .post(
+            Some(&env.key),
+            "application/x-protobuf",
+            None,
+            protobuf_of(&body),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let reply = ExportTraceServiceResponse::decode(&bytes[..]).unwrap();
+    assert_eq!(reply.partial_success.unwrap().rejected_spans, 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_huge_session_id_does_not_fail_the_batch(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let session = "s".repeat(6000);
+    let body = format!(
+        r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[
+        {{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","spanId":"1111111111111111","name":"a",
+          "attributes":[{{"key":"session.id","value":{{"stringValue":"{session}"}}}}]}},
+        {{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","spanId":"2222222222222222","name":"b"}}
+        ]}}]}}]}}"#
+    );
+    assert_eq!(env.post_json(&body).await.status(), StatusCode::OK);
+    assert_eq!(env.span_count(env.tenant).await, 2);
+    let longest: i32 = sqlx::query_scalar(
+        "SELECT max(length(session_id)) FROM session_queue WHERE tenant_id = $1",
+    )
+    .bind(env.tenant)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert!(longest <= 512);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn content_type_case_and_parameters_are_tolerated(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let res = env
+        .post(
+            Some(&env.key),
+            "Application/JSON; charset=utf-8",
+            None,
+            CLAUDE_CODE.as_bytes().to_vec(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(env.span_count(env.tenant).await, 5);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_body_over_2_mib_is_accepted(pool: PgPool) {
+    let env = Env::new(pool).await;
+    // 40 attributes of 64 KiB is about 2.6 MB, past axum's default body limit.
+    let big = "x".repeat(64 * 1024);
+    let attrs: Vec<String> = (0..40)
+        .map(|i| format!(r#"{{"key":"a{i}","value":{{"stringValue":"{big}"}}}}"#))
+        .collect();
+    let body = format!(
+        r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"traceId":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "spanId":"1111111111111111","name":"big","attributes":[{}]}}]}}]}}]}}"#,
+        attrs.join(",")
+    );
+    assert!(body.len() > 2 * 1024 * 1024);
+    assert_eq!(env.post_json(&body).await.status(), StatusCode::OK);
+    assert_eq!(env.span_count(env.tenant).await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_declared_content_length_over_16_mib_is_a_413(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let len = 16 * 1024 * 1024 + 1;
+    let req = Request::post("/v1/traces")
+        .header("content-type", "application/x-protobuf")
+        .header("authorization", format!("Bearer {}", env.key))
+        .header("content-length", len.to_string())
+        .body(Body::from(vec![0u8; len]))
+        .unwrap();
+    let res = env.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
