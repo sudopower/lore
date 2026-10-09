@@ -402,3 +402,70 @@ pub async fn index_text(
     tx.commit().await?;
     Ok(indexed.len())
 }
+
+/// Rows per `INSERT` of spans: 14 binds each stays well under Postgres's 65535 limit.
+const SPAN_INSERT_CHUNK: usize = 1000;
+
+/// Upserts spans on `(tenant, trace, span)` and queues each distinct session with
+/// `last_span_at = now()`. A span that appears twice in `rows` keeps its last copy, because one
+/// `INSERT ... ON CONFLICT` cannot touch a row twice.
+pub async fn upsert_spans(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    rows: &[crate::otlp::SpanRow],
+) -> sqlx::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<&crate::otlp::SpanRow> = rows
+        .iter()
+        .rev()
+        .filter(|r| seen.insert((r.trace_id.as_str(), r.span_id.as_str())))
+        .collect();
+    unique.reverse();
+
+    for chunk in unique.chunks(SPAN_INSERT_CHUNK) {
+        let mut q = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO spans (tenant_id, trace_id, span_id, parent_span_id, session_id, name, \
+             kind, start_time, end_time, status_code, status_message, resource, attributes, events) ",
+        );
+        q.push_values(chunk, |mut b, r| {
+            b.push_bind(tenant_id)
+                .push_bind(&r.trace_id)
+                .push_bind(&r.span_id)
+                .push_bind(&r.parent_span_id)
+                .push_bind(&r.session_id)
+                .push_bind(&r.name)
+                .push_bind(&r.kind)
+                .push_bind(r.start_time)
+                .push_bind(r.end_time)
+                .push_bind(&r.status_code)
+                .push_bind(&r.status_message)
+                .push_bind(&r.resource)
+                .push_bind(&r.attributes)
+                .push_bind(&r.events);
+        });
+        q.push(
+            " ON CONFLICT (tenant_id, trace_id, span_id) DO UPDATE SET \
+             parent_span_id = EXCLUDED.parent_span_id, session_id = EXCLUDED.session_id, \
+             name = EXCLUDED.name, kind = EXCLUDED.kind, start_time = EXCLUDED.start_time, \
+             end_time = EXCLUDED.end_time, status_code = EXCLUDED.status_code, \
+             status_message = EXCLUDED.status_message, resource = EXCLUDED.resource, \
+             attributes = EXCLUDED.attributes, events = EXCLUDED.events, received_at = now()",
+        );
+        q.build().execute(&mut **tx).await?;
+    }
+
+    let mut sessions: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    for chunk in sessions.chunks(SPAN_INSERT_CHUNK) {
+        let mut q = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_queue (tenant_id, session_id, last_span_at) ",
+        );
+        q.push_values(chunk, |mut b, session| {
+            b.push_bind(tenant_id).push_bind(*session).push("now()");
+        });
+        q.push(" ON CONFLICT (tenant_id, session_id) DO UPDATE SET last_span_at = now()");
+        q.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}

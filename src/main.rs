@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lore::cli::{AdminCommand, AskArgs, Client, RepoCommand, SearchArgs};
+use lore::cli::{AdminCommand, AskArgs, Client, OtlpCommand, RepoCommand, SearchArgs};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -49,6 +49,11 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Send OpenTelemetry traces to an OTLP/HTTP endpoint (needs an API key)
+    Otlp {
+        #[command(subcommand)]
+        command: OtlpCommand,
+    },
     /// Search the tenant's indexed code, docs, sessions and notes (needs an API key)
     Search(SearchArgs),
     /// Ask a question and get an answer with citations (needs an API key)
@@ -83,6 +88,10 @@ async fn main() -> Result<()> {
         Command::Repo { command } => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
             lore::cli::run_repo(&client, command).await
+        }
+        Command::Otlp { command } => {
+            let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
+            lore::cli::run_otlp(&client, command).await
         }
         Command::Search(args) => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;

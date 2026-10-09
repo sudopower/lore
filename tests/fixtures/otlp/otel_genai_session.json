@@ -1,0 +1,107 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "genai-fixture-app"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "otel-genai"
+          },
+          "spans": [
+            {
+              "traceId": "9d2c41f07be3465a8f10c7e5d3a96b21",
+              "spanId": "b7c8d9e0f1a20001",
+              "parentSpanId": "",
+              "name": "chat gpt-5",
+              "kind": 1,
+              "startTimeUnixNano": "1791450000000000000",
+              "endTimeUnixNano": "1791450002000000000",
+              "attributes": [
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-fixture-2"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-5"
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "stringValue": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"How many plans do we have?\"}]}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "stringValue": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"We have three plans: Free, Pro and Team.\"}]}]"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "9d2c41f07be3465a8f10c7e5d3a96b21",
+              "spanId": "b7c8d9e0f1a20002",
+              "parentSpanId": "",
+              "name": "chat gpt-5",
+              "kind": 1,
+              "startTimeUnixNano": "1791450010000000000",
+              "endTimeUnixNano": "1791450012000000000",
+              "attributes": [
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-fixture-2"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-5"
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "stringValue": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"How many plans do we have?\"}]},{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"We have three plans: Free, Pro and Team.\"}]},{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"And which plan has the most seats?\"}]}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "stringValue": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"Team has the most seats, with 25.\"}]}]"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

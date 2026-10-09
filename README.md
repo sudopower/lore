@@ -195,6 +195,19 @@ How it ranks: the query is run twice, once against the Postgres full-text index 
 
 The CLI prints, for each hit, `path:start-end  (score 0.032)  symbols` (the title when there is no path), then the first 3 snippet lines indented by 4 spaces. `--json` prints the server's JSON on one line. No hits prints `no results` on stderr and exits 0.
 
+## Traces
+
+`POST /v1/traces` takes OpenTelemetry traces over OTLP/HTTP, so an agent or a collector can export its sessions to lore. It needs an `ingest` key. Send `Content-Type: application/json` or `application/x-protobuf`, optionally with `Content-Encoding: gzip`. Anything else is a 415. A bad body is a 400, a body over 16 MiB (or one that unzips to more than 64 MiB) is a 413. The answer is an empty `ExportTraceServiceResponse` in the format of the request.
+
+Spans are stored per tenant, keyed by trace id and span id, so sending a span again updates it. A span's session is its `session.id` attribute, else `gen_ai.conversation.id`, else the resource's `session.id`, else its trace id. Each session is queued for indexing. Strings longer than 64 KiB are cut and end with `…[truncated]`.
+
+```bash
+lore otlp send tests/fixtures/otlp/claude_code_session.json          # JSON, needs --url and --key
+lore otlp send tests/fixtures/otlp/otel_genai_session.json --protobuf --gzip
+```
+
+`lore otlp send <FILE.json>` posts an OTLP JSON file to `/v1/traces` with the global `--url` and `--key`. `--protobuf` converts it to protobuf first, and `--gzip` compresses the body. It prints `HTTP <status>` and exits non-zero when the server does not answer 2xx.
+
 ## Ask
 
 `POST /v1/ask` answers a question from the key's tenant, with numbered citations. It needs a `read` key. Fast mode runs one hybrid search (the same as `/v1/search`), puts the best passages in a prompt as numbered sources, and makes one model call.

@@ -9,6 +9,7 @@ pub mod error;
 pub mod http;
 pub mod llm;
 pub mod mcp;
+pub mod otlp;
 pub mod repo;
 pub mod search;
 pub mod store;

@@ -112,6 +112,28 @@ impl Client {
         Ok(())
     }
 
+    /// POSTs raw bytes and returns the status and body text of the reply, whatever the status.
+    /// For OTLP, where the caller prints the status itself.
+    pub async fn post_raw(
+        &self,
+        path: &str,
+        auth: Auth,
+        content_type: &str,
+        content_encoding: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<(u16, String)> {
+        let mut req = self
+            .request(Method::POST, path, auth)?
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        if let Some(enc) = content_encoding {
+            req = req.header(reqwest::header::CONTENT_ENCODING, enc);
+        }
+        let res = req.body(body).send().await.context("sending the request")?;
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap_or_default();
+        Ok((status, text))
+    }
+
     /// Uploads a file as the raw request body with `PUT`, streaming it from disk.
     pub async fn put_file<T: DeserializeOwned>(
         &self,
@@ -139,7 +161,7 @@ impl Client {
 }
 
 /// The `error` field of the server's JSON error body, or the raw text when it is not one.
-fn error_message(body: &str) -> String {
+pub(crate) fn error_message(body: &str) -> String {
     #[derive(serde::Deserialize)]
     struct ErrorBody {
         error: String,
