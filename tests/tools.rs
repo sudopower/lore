@@ -785,3 +785,64 @@ async fn tool_defs_match_what_run_tool_accepts(pool: PgPool) {
         }
     }
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn read_file_refuses_a_file_over_10_mib_and_not_one_at_the_limit(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let limit = 10 * 1024 * 1024;
+    // Sparse files: no real disk is used. Zero bytes would read as binary, so the file at the
+    // limit is checked through the size error not firing, and the one above must fire it.
+    let big = std::fs::File::create(env.checkout().join("big.txt")).unwrap();
+    big.set_len(limit + 1).unwrap();
+    let text = err(env
+        .run(
+            "read_file",
+            json!({ "source": "sample", "path": "big.txt" }),
+        )
+        .await);
+    assert_eq!(text, "file too large");
+
+    let edge = std::fs::File::create(env.checkout().join("edge.txt")).unwrap();
+    edge.set_len(limit).unwrap();
+    let text = err(env
+        .run(
+            "read_file",
+            json!({ "source": "sample", "path": "edge.txt" }),
+        )
+        .await);
+    assert_eq!(
+        text, "binary file",
+        "a file at the limit is not 'too large'"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn read_file_strips_carriage_returns(pool: PgPool) {
+    let env = Env::new(pool).await;
+    std::fs::write(env.checkout().join("win.txt"), "one\r\ntwo\r\n").unwrap();
+    let text = ok(env
+        .run(
+            "read_file",
+            json!({ "source": "sample", "path": "win.txt" }),
+        )
+        .await);
+    assert_eq!(text, "sample/win.txt (lines 1-2 of 2)\n1: one\n2: two");
+    assert!(!text.contains('\r'), "{text:?}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unknown_tool_name_is_cut_to_64_chars(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let name = "x".repeat(200);
+    let text = err(env.run(&name, json!({})).await);
+    assert_eq!(text, format!("unknown tool: {}", "x".repeat(64)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_session_with_a_nul_in_the_id_is_session_not_found(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let text = err(env
+        .run("get_session", json!({ "session_id": "abc\u{0}def" }))
+        .await);
+    assert_eq!(text, "session not found");
+}
