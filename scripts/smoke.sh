@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for a running lore server.
 #
-#   scripts/smoke.sh <stage>      stage is m1, m2, m4, or all (every defined stage_* function, in order)
+#   scripts/smoke.sh <stage>      stage is m1, m2, m4, m5, or all (every defined stage_* function, in order)
 #
 # Needs LORE_URL and LORE_ADMIN_TOKEN in the environment, and lore, jq and git on PATH.
 # Each run creates fresh tenants, so it can be repeated against the same server.
@@ -134,16 +134,39 @@ stage_m4() {
   echo "SMOKE M4 OK"
 }
 
+# M5: a deep-mode answer from the agent loop. Run against the fake model, which asks for a tool
+# first, so the answer is deterministic and the server needs no model key.
+stage_m5() {
+  local K D A I
+
+  K=$(new_tenant deep) || exit 1
+  D=$(fixture_dir) || exit 1
+
+  LORE_KEY=$K lore repo push "$D" --name sample --json >/dev/null || fail "push failed"
+
+  A=$(LORE_KEY=$K lore ask --mode deep "list every plan and its seat limit" --json) \
+    || fail "ask failed"
+  assert_jq "$A" '.mode == "deep"' "the answer should be in deep mode"
+  assert_jq "$A" '.tool_calls >= 1' "the agent should have called at least one tool"
+  assert_jq "$A" '[.citations[].path] | index("src/billing/plans.rs") != null' "the answer should cite src/billing/plans.rs"
+  assert_jq "$A" '.latency_ms < 30000' "the answer should take under 30 seconds"
+
+  I=$(curl -s "$LORE_URL/v1/info") || fail "info failed"
+  assert_jq "$I" '.modes == ["fast","deep"]' "/v1/info should list fast and deep"
+
+  echo "SMOKE M5 OK"
+}
+
 main() {
   local stage=${1:-} fn missing=""
   case "$stage" in
     m[0-9] | all) ;;
-    *) fail "usage: scripts/smoke.sh <stage> (m1, m2, m4, or all)" ;;
+    *) fail "usage: scripts/smoke.sh <stage> (m1, m2, m4, m5, or all)" ;;
   esac
 
   [ -n "${LORE_URL:-}" ] || missing="$missing LORE_URL"
   [ -n "${LORE_ADMIN_TOKEN:-}" ] || missing="$missing LORE_ADMIN_TOKEN"
-  for cmd in lore jq git; do
+  for cmd in lore jq git curl; do
     command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd(on PATH)"
   done
   [ -z "$missing" ] || fail "missing:$missing"

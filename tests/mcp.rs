@@ -331,7 +331,7 @@ async fn ask_returns_the_answer_with_sources_then_the_json(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn ask_deep_is_a_tool_error_until_it_exists(pool: PgPool) {
+async fn ask_deep_runs_the_agent_loop_and_a_blank_question_is_an_error(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
@@ -341,8 +341,15 @@ async fn ask_deep_is_a_tool_error_until_it_exists(pool: PgPool) {
         json!({ "question": "list every plan and its seat limit", "mode": "deep" }),
     )
     .await;
-    assert!(is_error(&res));
-    assert_eq!(texts(&res), ["deep mode is not available yet"]);
+    assert!(!is_error(&res), "{:?}", texts(&res));
+    let texts = texts(&res);
+    assert_eq!(texts.len(), 2);
+    let full: Value = serde_json::from_str(&texts[1]).expect("the second item is JSON");
+    assert_eq!(full["mode"], "deep");
+    assert!(full["tool_calls"].as_u64().unwrap() >= 1, "{full}");
+    let citations = full["citations"].as_array().unwrap();
+    assert!(citations.iter().any(|c| c["path"] == PLANS), "{full}");
+    assert!(texts[0].contains(PLANS), "{}", texts[0]);
 
     let blank = call(&client, "ask", json!({ "question": " " })).await;
     assert!(is_error(&blank));
@@ -415,4 +422,33 @@ async fn the_host_header_is_unchecked_unless_allowed_hosts_are_set(pool: PgPool)
     )
     .await;
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ask_refuses_a_question_over_2000_characters_in_both_modes(pool: PgPool) {
+    let (url, key, _) = start(pool).await;
+    let client = connect(&url, &key).await;
+
+    for mode in ["fast", "deep"] {
+        let long = call(
+            &client,
+            "ask",
+            json!({ "question": "\u{e9}".repeat(2001), "mode": mode }),
+        )
+        .await;
+        assert!(is_error(&long), "{mode}");
+        let text = texts(&long).join("\n");
+        assert!(
+            text.contains("question must be at most 2000 characters"),
+            "{text}"
+        );
+    }
+    let ok = call(
+        &client,
+        "ask",
+        json!({ "question": "\u{e9}".repeat(2000), "mode": "deep" }),
+    )
+    .await;
+    assert!(!is_error(&ok), "{:?}", texts(&ok));
+    client.cancel().await.unwrap();
 }

@@ -1,5 +1,5 @@
 //! Answers with citations. Fast mode (one search, one model call) lives in [`fast`]; the prompt
-//! it sends is built in [`prompt`]. The request and response types here are shared by the HTTP
+//! it sends is built in [`prompt`]. Deep mode (an agent loop over the [`tools`]) lives in [`deep`]. The request and response types here are shared by the HTTP
 //! route, the CLI, the web page and MCP.
 
 use std::time::Instant;
@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::http::AppState;
+use crate::search::MAX_QUERY_CHARS;
 
+pub mod deep;
 pub mod fast;
 pub mod prompt;
 pub mod tools;
@@ -69,24 +71,28 @@ pub struct AskResponse {
     pub latency_ms: u64,
 }
 
-/// Answers `req.question` from the tenant's indexed material. A blank question is a
-/// `BadRequest`, and so is deep mode until it exists.
+/// Answers `req.question` from the tenant's indexed material. A blank question and one over
+/// 2000 characters are a `BadRequest`, and so is deep mode with a model provider that cannot use tools.
 pub async fn ask(
     state: &AppState,
     tenant_id: Uuid,
     req: AskRequest,
 ) -> Result<AskResponse, AppError> {
     let started = Instant::now();
-    if req.question.trim().is_empty() {
+    let question = req.question.trim();
+    if question.is_empty() {
         return Err(AppError::BadRequest("question is required".to_string()));
+    }
+    // Checked here, before the mode split and before deep mode takes a slot of the day, so a
+    // refused question costs nothing. Both modes send the question to the model.
+    if question.chars().count() > MAX_QUERY_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "question must be at most {MAX_QUERY_CHARS} characters"
+        )));
     }
     let mut res = match req.mode {
         Mode::Fast => fast::answer(state, tenant_id, &req).await?,
-        Mode::Deep => {
-            return Err(AppError::BadRequest(
-                "deep mode is not available yet".to_string(),
-            ));
-        }
+        Mode::Deep => deep::answer(state, tenant_id, &req).await?,
     };
     res.latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(res)

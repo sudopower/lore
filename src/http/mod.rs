@@ -12,6 +12,7 @@ use sqlx::PgPool;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::answer::deep::DeepGuard;
 use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub models: Models,
     /// One lock per source, held while a bundle is ingested.
     pub source_locks: Arc<SourceLocks>,
+    /// Per-tenant slots and the daily count of deep-mode questions.
+    pub deep_guard: Arc<DeepGuard>,
 }
 
 pub fn router(state: AppState) -> Router {

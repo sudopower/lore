@@ -45,5 +45,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6.5"

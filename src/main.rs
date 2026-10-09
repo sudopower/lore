@@ -164,6 +164,7 @@ async fn serve(config: Config) -> Result<()> {
         llm,
         models,
         source_locks: Default::default(),
+        deep_guard: Default::default(),
     };
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(session_worker(state.clone(), stop_rx));

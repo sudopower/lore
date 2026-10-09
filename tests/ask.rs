@@ -169,17 +169,6 @@ async fn another_tenants_documents_are_not_used(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn deep_mode_is_not_available_yet(pool: PgPool) {
-    let data = tempfile::tempdir().unwrap();
-    let (router, key) = indexed(pool, &data).await;
-
-    let body = json!({ "question": QUESTION, "mode": "deep" });
-    let (status, body) = ask(&router, &key, body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "deep mode is not available yet");
-}
-
-#[sqlx::test(migrations = "./migrations")]
 async fn bad_requests_are_400(pool: PgPool) {
     let data = tempfile::tempdir().unwrap();
     let router = test_router(test_state(pool, data.path()));
@@ -253,7 +242,7 @@ async fn info_needs_no_key(pool: PgPool) {
     assert_eq!(
         String::from_utf8(bytes.to_vec()).unwrap(),
         format!(
-            r#"{{"version":"{}","llm":"fake","embedder":"hash","modes":["fast"]}}"#,
+            r#"{{"version":"{}","llm":"fake","embedder":"hash","modes":["fast","deep"]}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

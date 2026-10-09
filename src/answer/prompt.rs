@@ -8,6 +8,14 @@ Use only the numbered sources. Cite every claim with its source number in square
 If the sources do not contain the answer, say so and say what is missing. \
 Answer in at most 8 short sentences or a short list. Count carefully when asked how many.";
 
+/// The system prompt of deep mode. The model finds its own evidence with the tools and cites
+/// code as `[path:start-end]` (the path without the source prefix) and sessions as `[session:<id>]`.
+pub const DEEP_SYSTEM: &str = "You answer questions about a team's code, documents and agent sessions. \
+Use the tools to find evidence before answering: search for relevant passages, grep for exact names, read_file to check details, get_session to read an agent session. \
+For 'how many' or 'list all' questions, grep for every occurrence instead of trusting search alone. \
+Cite every claim as [path:start-end] for code, using the path without the source prefix, or [session:<id>] for sessions. \
+Be concise.";
+
 /// The most lines of a passage that go into the prompt.
 const MAX_LINES: usize = 120;
 

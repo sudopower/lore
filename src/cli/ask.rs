@@ -13,7 +13,7 @@ use crate::answer::{AskRequest, AskResponse, Citation, Mode};
 pub struct AskArgs {
     /// The question
     question: String,
-    /// fast: one search and one model call. deep: an agent loop (not available yet)
+    /// fast: one search and one model call. deep: an agent loop with tools and a time budget
     #[arg(long, value_enum, default_value_t = Mode::Fast)]
     mode: Mode,
     /// How many sources to retrieve (1 to 50)
