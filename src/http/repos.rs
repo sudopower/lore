@@ -96,7 +96,7 @@ pub async fn list_repos(
 }
 
 /// True when the error is, or is caused by, the body limit layer's "length limit exceeded".
-fn is_length_limit(e: &(dyn StdError + 'static)) -> bool {
+pub(crate) fn is_length_limit(e: &(dyn StdError + 'static)) -> bool {
     let mut cur: Option<&(dyn StdError + 'static)> = Some(e);
     while let Some(err) = cur {
         if err.to_string().contains("length limit exceeded") {

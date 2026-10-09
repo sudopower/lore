@@ -26,6 +26,7 @@ pub mod info;
 pub mod me;
 pub mod repos;
 pub mod search;
+pub mod traces;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/repos/{id}/bundle",
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
+        )
+        .route(
+            "/v1/traces",
+            post(traces::post_traces).layer(RequestBodyLimitLayer::new(16 * 1024 * 1024)),
         )
         .route("/v1/search", get(search::get_search))
         .route("/v1/ask", post(ask::post_ask))
