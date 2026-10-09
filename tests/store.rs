@@ -56,6 +56,7 @@ fn doc(source: &Source, external_id: &str, hash: &str) -> NewDocument {
         uri: Some(format!("src/{external_id}")),
         metadata: json!({ "lang": "rust" }),
         content_hash: hash.to_string(),
+        body: None,
     }
 }
 
@@ -850,6 +851,69 @@ async fn document_text_joins_the_chunks_in_order_for_the_owning_tenant_only(pool
 
     assert!(document_text(&pool, b, id).await.is_none(), "other tenant");
     assert!(document_text(&pool, a, Uuid::new_v4()).await.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn document_text_returns_the_stored_body_and_not_the_joined_chunks(pool: PgPool) {
+    let state = state(&pool);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let src = ensure_source(&pool, a, "documents", "notes", None)
+        .await
+        .unwrap();
+    // The body keeps what the chunks cannot: CRLF, blank lines and a trailing newline.
+    let sent = "one\r\n\r\n\r\ntwo\n";
+    let mut d = doc(&src, "n1", "h1");
+    d.kind = "note".to_string();
+    d.body = Some(sent.to_string());
+    index_text(&state, a, &src, d, two_chunks(), "n1")
+        .await
+        .unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM documents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (_, text) = document_text(&pool, a, id).await.expect("owner reads it");
+    assert_eq!(text, sent);
+    assert!(document_text(&pool, b, id).await.is_none(), "other tenant");
+
+    // Writing the document again replaces the body, and a document without one is rebuilt from
+    // its chunks.
+    let mut d = doc(&src, "n1", "h2");
+    d.kind = "note".to_string();
+    d.body = Some("replaced".to_string());
+    index_text(&state, a, &src, d, two_chunks(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(document_text(&pool, a, id).await.unwrap().1, "replaced");
+    let mut d = doc(&src, "n1", "h3");
+    d.kind = "note".to_string();
+    index_text(&state, a, &src, d, two_chunks(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(
+        document_text(&pool, a, id).await.unwrap().1,
+        "pub fn limits(plan: Plan) -> Limits\nseats per day"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_empty_body_is_a_body(pool: PgPool) {
+    let state = state(&pool);
+    let t = tenant(&state, "acme").await;
+    let src = ensure_source(&pool, t, "documents", "notes", None)
+        .await
+        .unwrap();
+    let mut d = doc(&src, "n1", "h1");
+    d.body = Some(String::new());
+    index_text(&state, t, &src, d, two_chunks(), "n1")
+        .await
+        .unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM documents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(document_text(&pool, t, id).await.unwrap().1, "");
 }
 
 /// Stores `chunks` as one document and reads its text back.

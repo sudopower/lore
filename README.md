@@ -222,9 +222,9 @@ curl -X POST "$LORE_URL/v1/documents" \
 # {"upserted":1,"unchanged":0,"chunks":1}
 ```
 
-`source` names a group of documents (1 to 100 characters of `A-Z a-z 0-9 . _ -`; it is created on first use). `documents` has 1 to 100 entries. Each has an `external_id` (1 to 512 bytes, unique within the source), a `title`, a `text` of at most 1 MiB, and optionally `kind` (`note`, the default, or `doc`), `uri` (shown with search hits) and `metadata` (a JSON object). Anything invalid is a 400 and nothing of that request is written. The body may be up to 128 MiB; more is a 413.
+`source` names a group of documents (1 to 100 characters of `A-Z a-z 0-9 . _ -`, but not `.` or `..`; it is created on first use). `documents` has 1 to 100 entries. Each has an `external_id` (1 to 512 bytes, unique within the source, with no `.` or `..` between slashes, so `a.b` and `a/.b` are fine but `..` and `a/../b` are not), a `title` of at most 1 KiB, a `text` of at most 1 MiB, and optionally `kind` (`note`, the default, or `doc`), `uri` (shown with search hits) and `metadata` (a JSON object of at most 64 KiB once serialized). A text that makes more than 1000 chunks is refused too. Anything invalid is a 400 and nothing of that request is written. The body may be up to 128 MiB; more is a 413.
 
-Putting an `external_id` again replaces the document. When its kind, title, text, uri and metadata are all the same as stored, it is skipped and counted in `unchanged`, so repeating a sync is cheap. If one id appears twice in a request, the documents are handled in order and the last one wins. The text is split into sections at markdown headings.
+Putting an `external_id` again replaces the document. When its kind, title, text, uri and metadata are all the same as stored, it is skipped and counted in `unchanged`, so repeating a sync is cheap. If one id appears twice in a request, the documents are handled in order and the last one wins. The text is split into sections at markdown headings, and long sections into overlapping windows of lines. All of the text is searchable: a window is kept within 8,000 characters, and a single line longer than that is split into several chunks (at a space when there is one close to the end) instead of being cut.
 
 ```bash
 lore doc put --source notes --id n1 --title "Review" --text "The quarterly zorblax review moved to Thursdays."
@@ -233,7 +233,7 @@ lore doc get <DOCUMENT_ID>                      # prints the text
 lore doc rm --source notes --id n1
 ```
 
-`GET /v1/documents/{id}` (a `read` key) returns `{"id", "kind", "title", "uri", "metadata", "text"}` for any document of the tenant, using the `document_id` of a search hit; the text is cut at 100,000 characters. `DELETE /v1/documents/{source}/{external_id}` (an `ingest` key) answers 204, or 404 when the tenant has no such document; an `external_id` may contain `/`, and other special characters must be percent-encoded. `lore doc put` accepts either `--file` or `--text`, and prints the server's JSON.
+`GET /v1/documents/{id}` (a `read` key) returns `{"id", "kind", "title", "uri", "metadata", "text"}` for any document of the tenant, using the `document_id` of a search hit. For a document put through the API the text is exactly what was sent (line endings, blank lines and the final newline included), cut at 100,000 characters; for repo files and sessions it is rebuilt from the indexed chunks. `DELETE /v1/documents/{source}/{external_id}` (an `ingest` key) answers 204, or 404 when the tenant has no such document; an `external_id` may contain `/`, and other special characters must be percent-encoded. `lore doc put` accepts either `--file` or `--text`, and prints the server's JSON.
 
 ## Ask
 

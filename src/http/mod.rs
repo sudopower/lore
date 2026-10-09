@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::middleware::from_fn_with_state;
+use axum::middleware::{from_fn_with_state, map_response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -75,7 +75,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/documents",
             post(documents::post_documents)
-                .layer(RequestBodyLimitLayer::new(documents::BODY_LIMIT)),
+                .layer(RequestBodyLimitLayer::new(documents::BODY_LIMIT))
+                .layer(map_response(documents::json_payload_too_large)),
         )
         .route("/v1/documents/{id}", get(documents::get_document))
         .route(

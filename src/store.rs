@@ -39,6 +39,10 @@ pub struct NewDocument {
     pub uri: Option<String>,
     pub metadata: serde_json::Value,
     pub content_hash: String,
+    /// The exact text as it was sent, kept only for documents of the documents API: chunks are cut
+    /// and overlap, so they cannot give back the original. Repo files and sessions leave it `None`
+    /// and are rebuilt from their chunks by [`document_text`].
+    pub body: Option<String>,
 }
 
 /// A chunk with the texts that were derived from it: `lexical` feeds the full-text index and
@@ -181,8 +185,9 @@ pub struct DocumentRow {
     pub path: Option<String>,
 }
 
-/// The document and its chunks in `ord` order, or `None` when the id is unknown or belongs to
-/// another tenant. Lines that overlapping chunks share are written once, see [`join_chunks`].
+/// The document and its text, or `None` when the id is unknown or belongs to another tenant. The
+/// text is the stored body when the document has one (documents API), otherwise its chunks in
+/// `ord` order, where lines that overlapping chunks share are written once, see [`join_chunks`].
 /// The text is not capped; callers cut it to their own limit.
 ///
 /// A database error is logged and also gives `None`: callers see "not found" rather than a
@@ -202,14 +207,22 @@ pub async fn document_text(
     }
 }
 
+/// A document row with its stored body.
+#[derive(sqlx::FromRow)]
+struct StoredDocument {
+    #[sqlx(flatten)]
+    row: DocumentRow,
+    body: Option<String>,
+}
+
 async fn load_document(
     pool: &PgPool,
     tenant_id: Uuid,
     document_id: Uuid,
 ) -> sqlx::Result<Option<(DocumentRow, String)>> {
-    let row: Option<DocumentRow> = sqlx::query_as(
+    let found: Option<StoredDocument> = sqlx::query_as(
         "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri, d.metadata,
-                d.metadata->>'path' AS path
+                d.metadata->>'path' AS path, d.body
          FROM documents d
          JOIN sources s ON s.id = d.source_id
          WHERE d.id = $1 AND d.tenant_id = $2",
@@ -218,9 +231,12 @@ async fn load_document(
     .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
-    let Some(row) = row else {
+    let Some(StoredDocument { row, body }) = found else {
         return Ok(None);
     };
+    if let Some(body) = body {
+        return Ok(Some((row, body)));
+    }
     let chunks: Vec<(String, i32, i32)> = sqlx::query_as(
         "SELECT text, start_line, end_line FROM chunks
          WHERE document_id = $1 AND tenant_id = $2 ORDER BY ord",
@@ -277,8 +293,8 @@ pub async fn upsert_document(
 ) -> Result<Uuid, AppError> {
     let id: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO documents
-           (id, tenant_id, source_id, external_id, kind, title, uri, metadata, content_hash)
-         SELECT $1, s.tenant_id, s.id, $4, $5, $6, $7, $8, $9
+           (id, tenant_id, source_id, external_id, kind, title, uri, metadata, content_hash, body)
+         SELECT $1, s.tenant_id, s.id, $4, $5, $6, $7, $8, $9, $10
          FROM sources s WHERE s.id = $3 AND s.tenant_id = $2
          ON CONFLICT (source_id, external_id) DO UPDATE SET
            kind = EXCLUDED.kind,
@@ -286,6 +302,7 @@ pub async fn upsert_document(
            uri = EXCLUDED.uri,
            metadata = EXCLUDED.metadata,
            content_hash = EXCLUDED.content_hash,
+           body = EXCLUDED.body,
            updated_at = now()
          RETURNING id",
     )
@@ -298,6 +315,7 @@ pub async fn upsert_document(
     .bind(&doc.uri)
     .bind(&doc.metadata)
     .bind(&doc.content_hash)
+    .bind(&doc.body)
     .fetch_optional(&mut **tx)
     .await?;
     id.ok_or(AppError::NotFound)

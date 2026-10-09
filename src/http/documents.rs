@@ -1,17 +1,22 @@
 //! Notes and documents: `POST /v1/documents`, `GET /v1/documents/{id}` and
 //! `DELETE /v1/documents/{source}/{*external_id}`.
+//!
+//! Everything a request can get wrong is checked in `parse` before the first write, including the
+//! chunk count, so a bad document leaves the whole request unwritten. The text is stored as sent
+//! (`documents.body`) next to its chunks, because the chunks are cut and overlap.
 
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::{Caller, Scope};
-use crate::chunk::chunk_markdown;
+use crate::chunk::{Chunk, chunk_markdown_split};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::http::repos::is_length_limit;
@@ -21,9 +26,27 @@ use crate::store::{self, NewDocument};
 const MAX_DOCUMENTS: usize = 100;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_EXTERNAL_ID_BYTES: usize = 512;
+const MAX_TITLE_BYTES: usize = 1024;
+/// Length of the serialized metadata object.
+const MAX_METADATA_BYTES: usize = 64 * 1024;
+/// Chunks per document. Each one is embedded, so this bounds the work a 1 MiB text can cause.
+const MAX_CHUNKS: usize = 1000;
 
 /// Room for 100 documents of 1 MiB each plus JSON escaping and the other fields.
 pub const BODY_LIMIT: usize = 128 * 1024 * 1024;
+
+/// The body limit layer answers a too large Content-Length with a plain text 413 of its own; this
+/// gives it the same JSON error as a body that is too large while streaming.
+pub async fn json_payload_too_large(res: Response) -> Response {
+    let is_json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if res.status() == StatusCode::PAYLOAD_TOO_LARGE && !is_json {
+        return AppError::PayloadTooLarge.into_response();
+    }
+    res
+}
 
 #[derive(Deserialize)]
 struct PutRequest {
@@ -41,7 +64,7 @@ struct DocumentIn {
     metadata: Option<Value>,
 }
 
-/// A validated document and the hash of everything that is stored for it.
+/// A validated document, its chunks and the hash of everything that is stored for it.
 struct Prepared {
     external_id: String,
     kind: String,
@@ -50,6 +73,7 @@ struct Prepared {
     uri: Option<String>,
     metadata: Value,
     hash: String,
+    chunks: Vec<Chunk>,
 }
 
 #[derive(Serialize)]
@@ -102,6 +126,11 @@ fn content_hash(
     hex::encode(h.finalize())
 }
 
+/// A `.` or `..` segment would climb out of the source when the id is used as a path in a URL.
+fn has_dot_segment(external_id: &str) -> bool {
+    external_id.split('/').any(|s| s == "." || s == "..")
+}
+
 fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
     let at = |field: &str| format!("documents[{index}].{field}");
     if doc.external_id.is_empty() || doc.external_id.len() > MAX_EXTERNAL_ID_BYTES {
@@ -110,8 +139,20 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
             at("external_id")
         )));
     }
+    if has_dot_segment(&doc.external_id) {
+        return Err(bad(format!(
+            "{} cannot have a . or .. segment",
+            at("external_id")
+        )));
+    }
     if doc.title.trim().is_empty() {
         return Err(bad(format!("{} must not be empty", at("title"))));
+    }
+    if doc.title.len() > MAX_TITLE_BYTES {
+        return Err(bad(format!(
+            "{} is over {MAX_TITLE_BYTES} bytes",
+            at("title")
+        )));
     }
     if doc.text.len() > MAX_TEXT_BYTES {
         return Err(bad(format!("{} is over 1 MiB", at("text"))));
@@ -124,6 +165,13 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
     if !metadata.is_object() {
         return Err(bad(format!("{} must be a JSON object", at("metadata"))));
     }
+    if metadata.to_string().len() > MAX_METADATA_BYTES {
+        return Err(bad(format!(
+            "{} is over {} KiB",
+            at("metadata"),
+            MAX_METADATA_BYTES / 1024
+        )));
+    }
     let strings = [
         &doc.external_id,
         &doc.title,
@@ -135,6 +183,12 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
             "documents[{index}] cannot contain a NUL character"
         )));
     }
+    let chunks = chunk_markdown_split(&doc.text, &doc.title, MAX_CHUNKS).ok_or_else(|| {
+        bad(format!(
+            "{} makes more than {MAX_CHUNKS} chunks",
+            at("text")
+        ))
+    })?;
     let hash = content_hash(&kind, &doc.title, &doc.text, doc.uri.as_deref(), &metadata);
     Ok(Prepared {
         external_id: doc.external_id,
@@ -144,16 +198,18 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
         uri: doc.uri,
         metadata,
         hash,
+        chunks,
     })
 }
 
-/// Parses and checks the whole body before anything is written, so a bad document leaves the
-/// others of the request unwritten too.
+/// Parses, checks and chunks the whole body before anything is written, so a bad document leaves
+/// the others of the request unwritten too.
 fn parse(bytes: &[u8]) -> Result<(String, Vec<Prepared>), AppError> {
     let req: PutRequest = serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
-    if !crate::http::repos::valid_repo_name(&req.source) {
+    if !crate::http::repos::valid_repo_name(&req.source) || req.source == "." || req.source == ".."
+    {
         return Err(bad(
-            "source must be 1 to 100 characters of A-Z, a-z, 0-9, . _ and -",
+            "source must be 1 to 100 characters of A-Z, a-z, 0-9, . _ and -, and not . or ..",
         ));
     }
     if !(1..=MAX_DOCUMENTS).contains(&req.documents.len()) {
@@ -185,7 +241,7 @@ pub async fn post_documents(
             bad("could not read the request body")
         }
     })?;
-    // Parsing and hashing up to 100 MiB is CPU work, so it stays off the async workers.
+    // Parsing, hashing and chunking up to 100 MiB is CPU work, so it stays off the async workers.
     let (source_name, docs) = tokio::task::spawn_blocking(move || parse(&bytes))
         .await
         .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("parse task failed")))??;
@@ -204,7 +260,6 @@ pub async fn post_documents(
             report.unchanged += 1;
             continue;
         }
-        let chunks = chunk_markdown(&doc.text, &doc.title);
         let new_doc = NewDocument {
             tenant_id,
             source_id: source.id,
@@ -214,9 +269,10 @@ pub async fn post_documents(
             uri: doc.uri,
             metadata: doc.metadata,
             content_hash: doc.hash,
+            body: Some(doc.text),
         };
         report.chunks +=
-            store::index_text(&state, tenant_id, &source, new_doc, chunks, &doc.title).await?;
+            store::index_text(&state, tenant_id, &source, new_doc, doc.chunks, &doc.title).await?;
         report.upserted += 1;
     }
     Ok(Json(report))
@@ -310,5 +366,80 @@ mod tests {
         let mut d = doc("a");
         d.text = "a\0b".to_string();
         assert!(prepare(0, d).is_err());
+    }
+
+    fn message(r: Result<Prepared, AppError>) -> String {
+        match r {
+            Err(AppError::BadRequest(m)) => m,
+            Err(e) => panic!("not a 400: {e:?}"),
+            Ok(_) => panic!("accepted"),
+        }
+    }
+
+    #[test]
+    fn title_and_metadata_have_size_limits() {
+        let mut d = doc("a");
+        d.title = "t".repeat(MAX_TITLE_BYTES);
+        assert!(prepare(0, d).is_ok());
+        let mut d = doc("a");
+        d.title = "t".repeat(MAX_TITLE_BYTES + 1);
+        assert!(message(prepare(0, d)).contains("title"));
+        // Bytes, not characters.
+        let mut d = doc("a");
+        d.title = "\u{e9}".repeat(MAX_TITLE_BYTES / 2 + 1);
+        assert!(prepare(0, d).is_err());
+
+        // `{"k":"..."}` is 8 bytes of framing around the value.
+        let mut d = doc("a");
+        d.metadata = Some(json!({"k": "m".repeat(MAX_METADATA_BYTES - 8)}));
+        assert!(prepare(0, d).is_ok());
+        let mut d = doc("a");
+        d.metadata = Some(json!({"k": "m".repeat(MAX_METADATA_BYTES - 7)}));
+        assert!(message(prepare(0, d)).contains("metadata"));
+    }
+
+    #[test]
+    fn dot_segments_are_rejected_in_ids() {
+        for id in [".", "..", "a/../b", "a/./b", "../a", "a/..", "./a", "a/."] {
+            assert!(message(prepare(0, doc(id))).contains("segment"), "{id}");
+        }
+        for id in [
+            "a.b", "..a", ".hidden", "a/.b", "a..b", "a/b.", "...", "a//b",
+        ] {
+            assert!(prepare(0, doc(id)).is_ok(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_document_over_the_chunk_limit_is_refused_with_the_limit_named() {
+        let mut d = doc("a");
+        d.text = "#\n".repeat(MAX_CHUNKS + 1);
+        let m = message(prepare(0, d));
+        assert!(m.contains("1000") && m.contains("chunks"), "{m}");
+        let mut d = doc("a");
+        d.text = "#\n".repeat(MAX_CHUNKS);
+        let ok = prepare(0, d).unwrap();
+        assert_eq!(ok.chunks.len(), MAX_CHUNKS);
+        // The chunks are the ones that get written, so the text is chunked once.
+        let mut d = doc("a");
+        d.title = "Title".to_string();
+        d.text = "# H\nbody".to_string();
+        let ok = prepare(0, d).unwrap();
+        assert_eq!(ok.chunks.len(), 1);
+        assert_eq!(ok.chunks[0].symbols, vec!["H".to_string()]);
+    }
+
+    #[test]
+    fn parse_refuses_dot_sources() {
+        let body = |source: &str| {
+            json!({"source": source, "documents": [{"external_id": "a", "title": "t", "text": "x"}]})
+                .to_string()
+        };
+        for source in [".", ".."] {
+            assert!(parse(body(source).as_bytes()).is_err(), "{source}");
+        }
+        for source in ["a.b", "..a", ".hidden", "a..", "notes"] {
+            assert!(parse(body(source).as_bytes()).is_ok(), "{source}");
+        }
     }
 }

@@ -691,6 +691,7 @@ impl Job<'_> {
             uri: None,
             metadata,
             content_hash,
+            body: None,
         };
         let chunks = chunk_file(path, &content);
         let n = index_text(

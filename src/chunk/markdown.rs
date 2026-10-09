@@ -1,6 +1,6 @@
 //! Markdown sections: each `#`, `##` or `###` heading starts one.
 
-use super::lines::windows;
+use super::lines::{Sink, split_windows, windows};
 use super::{Chunk, ChunkKind};
 
 const SECTION_MAX_LINES: usize = 120;
@@ -10,12 +10,33 @@ const WINDOW_OVERLAP: usize = 20;
 /// next heading, and its symbol is the heading text without the `#`s. Text before the first
 /// heading is a section whose symbol is `default_symbol`. A section over 120 lines becomes
 /// windows of 120 lines with 20 overlap. Headings inside fenced code blocks do not count.
+/// Chunk text is cut at 8,000 characters, which is right for repo files; see
+/// [`chunk_markdown_split`] for text that must be kept whole.
 pub fn chunk_markdown(text: &str, default_symbol: &str) -> Vec<Chunk> {
-    let lines: Vec<&str> = text.lines().collect();
-    let default_symbols = vec![default_symbol.to_string()];
+    let mut sink = Sink::new(usize::MAX);
+    collect(text, default_symbol, false, &mut sink);
+    sink.chunks
+}
 
-    // (0-based line, symbols) for every section start, with the preamble first if there is one.
-    let mut starts: Vec<(usize, Vec<String>)> = Vec::new();
+/// Like [`chunk_markdown`], but no text is lost: windows shrink to fit 8,000 characters and a
+/// longer line is cut into several chunks with the same line numbers and symbols. Returns `None`
+/// as soon as the text would need more than `max_chunks` chunks, without building the rest.
+pub fn chunk_markdown_split(
+    text: &str,
+    default_symbol: &str,
+    max_chunks: usize,
+) -> Option<Vec<Chunk>> {
+    let mut sink = Sink::new(max_chunks);
+    collect(text, default_symbol, true, &mut sink).then_some(sink.chunks)
+}
+
+/// Chunks `text` into `sink`. Returns false when `split` is set and `sink` filled up.
+fn collect(text: &str, default_symbol: &str, split: bool, sink: &mut Sink) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+
+    // (0-based line, heading text) for every section start, with the preamble first if there is
+    // one. No heading text means the default symbol.
+    let mut starts: Vec<(usize, Option<&str>)> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     for (i, line) in lines.iter().enumerate() {
         if let Some(marker) = fence_marker(line) {
@@ -32,20 +53,19 @@ pub fn chunk_markdown(text: &str, default_symbol: &str) -> Vec<Chunk> {
             continue;
         }
         if let Some(heading) = heading_text(line) {
-            let symbols = if heading.is_empty() {
-                default_symbols.clone()
-            } else {
-                vec![heading.to_string()]
-            };
-            starts.push((i, symbols));
+            starts.push((i, Some(heading).filter(|h| !h.is_empty())));
+            // Every heading line has text, so each section gives at least one chunk.
+            if split && starts.len() > sink.max {
+                return false;
+            }
         }
     }
     if starts.first().is_none_or(|(i, _)| *i > 0) {
-        starts.insert(0, (0, default_symbols));
+        starts.insert(0, (0, None));
     }
 
-    let mut out = Vec::new();
-    for (n, (start, symbols)) in starts.iter().enumerate() {
+    for (n, (start, heading)) in starts.iter().enumerate() {
+        let symbols = vec![heading.unwrap_or(default_symbol).to_string()];
         let end = starts.get(n + 1).map_or(lines.len(), |(next, _)| *next);
         let (mut a, mut b) = (*start, end);
         // Trim blank edges so line ranges describe the text, not the spacing around it.
@@ -61,16 +81,30 @@ pub fn chunk_markdown(text: &str, default_symbol: &str) -> Vec<Chunk> {
         if section.iter().all(|l| l.trim().is_empty()) {
             continue;
         }
-        out.extend(windows(
-            section,
-            a,
-            SECTION_MAX_LINES,
-            WINDOW_OVERLAP,
-            symbols,
-            ChunkKind::Section,
-        ));
+        if split {
+            if !split_windows(
+                section,
+                a,
+                SECTION_MAX_LINES,
+                WINDOW_OVERLAP,
+                &symbols,
+                ChunkKind::Section,
+                sink,
+            ) {
+                return false;
+            }
+        } else {
+            sink.chunks.extend(windows(
+                section,
+                a,
+                SECTION_MAX_LINES,
+                WINDOW_OVERLAP,
+                &symbols,
+                ChunkKind::Section,
+            ));
+        }
     }
-    out
+    true
 }
 
 /// The heading text if `line` is an ATX heading of level 1 to 3: one to three `#`s at the start
@@ -193,5 +227,204 @@ mod tests {
         assert_eq!(chunks[0].symbols, vec!["A".to_string()]);
         assert_eq!(chunks[0].text, "# A\nbody");
         assert_eq!((chunks[1].start_line, chunks[1].end_line), (3, 4));
+    }
+
+    const BUDGET: usize = super::super::MAX_CHUNK_CHARS;
+
+    fn split(text: &str) -> Vec<Chunk> {
+        chunk_markdown_split(text, "doc", usize::MAX).unwrap()
+    }
+
+    #[test]
+    fn split_mode_matches_the_plain_mode_for_ordinary_text() {
+        let mut text = String::from("preface\n\n## Big\n");
+        for i in 1..=200 {
+            text.push_str(&format!("row {i}\n"));
+        }
+        text.push_str("\n# Last\ntail\n");
+        assert_eq!(split(&text), chunk_markdown(&text, "doc"));
+        assert_eq!(
+            split("# A\r\nbody\r\n# B\r\nmore"),
+            chunk_markdown("# A\r\nbody\r\n# B\r\nmore", "doc")
+        );
+        assert!(split("").is_empty());
+        assert!(split("\n \n").is_empty());
+    }
+
+    #[test]
+    fn a_long_single_line_is_split_not_cut() {
+        let words: Vec<String> = (0..4000).map(|i| format!("w{i}")).collect();
+        let line = format!("{} farendword", words.join(" "));
+        assert!(line.chars().count() > 20_000);
+        let chunks = split(&line);
+        assert!(chunks.len() >= 3);
+        for c in &chunks {
+            assert!(c.text.chars().count() <= BUDGET);
+            assert_eq!((c.start_line, c.end_line), (1, 1));
+            assert_eq!(c.symbols, vec!["doc".to_string()]);
+            assert_eq!(c.kind, ChunkKind::Section);
+        }
+        // The pieces add up to the line, and the last word is whole in the last piece.
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, line);
+        assert!(chunks.last().unwrap().text.ends_with(" farendword"));
+        // Cuts fall after a space, so no word is torn between two chunks.
+        for c in &chunks[..chunks.len() - 1] {
+            assert!(c.text.ends_with(' '), "{:?}", &c.text[c.text.len() - 10..]);
+        }
+    }
+
+    #[test]
+    fn an_unbroken_line_is_cut_on_char_boundaries_and_keeps_every_char() {
+        let line = "é€𝄞x".repeat(5000);
+        let chunks = split(&line);
+        assert_eq!(chunks.len(), 3);
+        for c in &chunks {
+            assert!(c.text.chars().count() <= BUDGET);
+        }
+        assert_eq!(chunks[0].text.chars().count(), BUDGET);
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, line);
+    }
+
+    #[test]
+    fn a_long_line_among_short_ones_keeps_its_own_line_number() {
+        let long = "z".repeat(BUDGET * 2 + 5);
+        let text = format!("# Head\nbefore\n{long}\nafter");
+        let chunks = split(&text);
+        let long_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.text.starts_with('z')).collect();
+        assert_eq!(long_chunks.len(), 3);
+        for c in &long_chunks {
+            assert_eq!((c.start_line, c.end_line), (3, 3));
+            assert_eq!(c.symbols, vec!["Head".to_string()]);
+        }
+        // The lines on both sides are still in some chunk.
+        assert!(chunks.iter().any(|c| c.text.contains("before")));
+        assert!(chunks.iter().any(|c| c.text.contains("after")));
+        // Nothing is repeated: the oversized line does not drag its neighbours into windows.
+        assert_eq!(
+            chunks.iter().filter(|c| c.text.contains("before")).count(),
+            1
+        );
+        assert_eq!(
+            chunks.iter().filter(|c| c.text.contains("after")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn windows_shrink_to_the_budget_and_every_row_is_in_a_chunk() {
+        let rows: Vec<String> = (0..300)
+            .map(|i| format!("row{i:03} {}", "x".repeat(93)))
+            .collect();
+        assert!(rows.iter().all(|r| r.chars().count() == 100));
+        let text = rows.join("\n");
+        let chunks = split(&text);
+        for c in &chunks {
+            assert!(c.text.chars().count() <= BUDGET);
+            assert_eq!(c.text.lines().count() as u32, c.end_line - c.start_line + 1);
+        }
+        for r in &rows {
+            assert!(chunks.iter().any(|c| c.text.contains(r.as_str())), "{r}");
+        }
+        // The plain mode loses rows to its cut, which is what this mode is for.
+        let plain = chunk_markdown(&text, "doc");
+        assert!(
+            rows.iter()
+                .any(|r| !plain.iter().any(|c| c.text.contains(r.as_str())))
+        );
+        // Windows overlap by 20 lines and still move forward.
+        assert!(chunks[1].start_line <= chunks[0].end_line);
+        assert!(chunks[1].start_line > chunks[0].start_line);
+        assert_eq!(chunks.last().unwrap().end_line, 300);
+    }
+
+    #[test]
+    fn short_windows_still_move_forward() {
+        // Two 3,000 character lines per window.
+        let rows: Vec<String> = (0..10)
+            .map(|i| format!("r{i} {}", "y".repeat(2997)))
+            .collect();
+        let text = rows.join("\n");
+        let chunks = split(&text);
+        for r in &rows {
+            assert!(chunks.iter().any(|c| c.text.contains(r.as_str())));
+        }
+        assert!(chunks.len() <= 20, "{} chunks", chunks.len());
+        for pair in chunks.windows(2) {
+            assert!(pair[1].start_line > pair[0].start_line);
+        }
+    }
+
+    #[test]
+    fn whitespace_only_long_lines_are_not_chunks() {
+        let text = format!("a\n{}\nb", " ".repeat(BUDGET * 3));
+        let chunks = split(&text);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| !c.text.trim().is_empty()));
+    }
+
+    #[test]
+    fn the_chunk_cap_is_exact() {
+        let text: String = (0..10).map(|i| format!("# h{i}\nbody\n")).collect();
+        assert_eq!(chunk_markdown_split(&text, "doc", 10).unwrap().len(), 10);
+        assert!(chunk_markdown_split(&text, "doc", 9).is_none());
+        assert!(chunk_markdown_split("text", "doc", 0).is_none());
+        assert_eq!(chunk_markdown_split("", "doc", 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_chunk_cap_counts_pieces_of_a_long_line_and_windows() {
+        let line = "q".repeat(BUDGET * 4);
+        assert_eq!(chunk_markdown_split(&line, "doc", 4).unwrap().len(), 4);
+        assert!(chunk_markdown_split(&line, "doc", 3).is_none());
+        let rows: String = (0..300).map(|_| format!("{}\n", "x".repeat(99))).collect();
+        let n = split(&rows).len();
+        assert!(n > 3);
+        assert!(chunk_markdown_split(&rows, "doc", n).is_some());
+        assert!(chunk_markdown_split(&rows, "doc", n - 1).is_none());
+    }
+
+    #[test]
+    fn chunking_stops_at_the_cap_instead_of_building_everything() {
+        // 2,000 lines of 7,000 characters would make 2,000 chunks.
+        let text: String = (0..2000)
+            .map(|_| format!("{}\n", "m".repeat(7000)))
+            .collect();
+        let mut sink = Sink::new(5);
+        assert!(!collect(&text, "doc", true, &mut sink));
+        assert_eq!(sink.chunks.len(), 5);
+
+        // A long line stops mid-way through its pieces.
+        let mut sink = Sink::new(2);
+        assert!(!collect(&"n".repeat(BUDGET * 50), "doc", true, &mut sink));
+        assert_eq!(sink.chunks.len(), 2);
+
+        // Bare headings are counted while scanning, before any chunk is built.
+        let text = "#\n".repeat(100_000);
+        let mut sink = Sink::new(5);
+        assert!(!collect(&text, "doc", true, &mut sink));
+        assert!(sink.chunks.is_empty());
+
+        // The plain mode has no cap.
+        let mut sink = Sink::new(usize::MAX);
+        assert!(collect(&"#\n".repeat(3000), "doc", false, &mut sink));
+        assert_eq!(sink.chunks.len(), 3000);
+    }
+
+    #[test]
+    fn split_mode_is_total() {
+        for text in [
+            "\u{0}",
+            "\r",
+            "\r\n\r\n",
+            "```",
+            "# ",
+            "\t#\t",
+            "é",
+            &"\n".repeat(1000),
+        ] {
+            let _ = chunk_markdown_split(text, "", 10);
+        }
     }
 }
