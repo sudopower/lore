@@ -12,21 +12,24 @@ Written in Rust, MIT licensed. Status: version 0.1. Indexing, search, both answe
 
 Indexing and search need no model and, once the embedding model is downloaded, no network. Answers call a model, by default the Anthropic API, so they need the network: see [Runs offline?](#runs-offline).
 
-## At a glance: one question, three ways
+## At a glance: two questions, three ways
 
-The question: "what's included in our entry-level billing plan?", asked of a private 1,816-file service. The plan is defined in a database seed migration, which lists 13 facts: price, included usage, overage rate, six limits, retention, audit logs, regions and one policy. Test files elsewhere in the repo repeat some of those values.
+Two questions asked of a private 1,816-file service, each answered three ways. Every answer was scored against facts read from the code.
 
-| | lore fast | lore deep | Claude Code in a checkout |
+| Question | lore fast | lore deep | Claude Code in a checkout |
 |---|---|---|---|
-| Time to answer | **4.9 s** | **13.3 s** | 28.0 s |
-| How it got there | one search, one model call | 4 tool calls | 5 turns of grep and read |
-| Found the seed migration | No. It answered from test files and said so | Yes | Yes |
-| Facts right, of 13 | 9 | **13** | **13** |
-| Facts wrong | 0 | 0 | 0, but it cited the wrong line (the next plan's row) |
+| "What's included in our entry-level billing plan?" (13 facts) | **4.9 s**, 9 of 13 | **13.3 s**, 13 of 13 | 28.0 s, 13 of 13, $0.27 |
+| "How does auth work in our control plane?" (10 facts) | **7.0 s**, 3 of 10 | 28.1 s, 10 of 10 | 22.3 s, 10 of 10, $0.32 |
 
-- **fast** gives a quick, cited answer that is only as good as its top 12 search hits. Here it said its values came from test files rather than the plan's definition, which was true.
-- **deep** searches until it finds the definition. It gave the same answer as Claude Code in under half the time.
-- All three used `claude-opus-5-5` on the same commit, run once each on 2026-10-22. Claude Code cost $0.27 for this question; lore's cost is not reported (see [lore vs Claude Code](#lore-vs-claude-code), which also has three more questions on a second repo).
+No answer stated a wrong fact. What the numbers show:
+
+- **fast** answers in seconds and is only as good as its top 12 search hits.
+  - On the billing question, the plan's definition (a seed migration) did not rank. fast answered from test files that repeat most of the values, and said so.
+  - On the auth question, it described one kind of service token where the code has three. It missed how each one is limited.
+- **deep** searches until it has the whole picture, and was complete both times. It took under half of Claude Code's time on the billing question and 26% more on the auth question, where it made 12 tool calls.
+- **lore searches every repo you index at once.** fast's auth answer also covered how a second indexed repo, an MCP client, handles the control plane's 401. A checkout sees one repo.
+
+All three used `claude-opus-5-5` and read the same code, run once each on 2026-10-22. For the auth question Claude Code read a commit 21 commits newer than lore's index, with no change to the auth code. lore ran with its defaults (effort `low` for fast, `medium` for deep). Claude Code ran in a checkout with effort `medium` for the billing question and `low` for the auth question. lore's cost is not reported: see [lore vs Claude Code](#lore-vs-claude-code), which also has three more questions on a second repo.
 
 ## How it works
 
