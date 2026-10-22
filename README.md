@@ -26,7 +26,10 @@ More questions, scores and setup: [benchmarks](docs/benchmarks.md).
 ## See it
 
 ```text
-$ lore ask "how are search results ranked?" --kind code
+$ lore repo push . --name lore              # index lore's own repo
+indexed lore at f8cd4b5: 105 indexed, 0 unchanged, 0 deleted, 2 skipped, 1523 chunks
+
+$ lore ask "how are search results ranked?" --source lore --kind code
 
 Search results come from a hybrid search. Postgres full-text ranking, which is
 good at exact names, is fused with pgvector similarity, which is good at meaning,
