@@ -21,6 +21,8 @@ The same questions about a private 1,816-file service, asked of lore and of Clau
 | "What's included in our entry-level billing plan?" | **4.9 s** | **13.3 s** | 28.0 s |
 | "How does auth work in our control plane?" | **7.0 s** | 28.1 s | 22.3 s |
 
+Claude Code gets faster with lore too: connected over MCP, it answered five questions **20% faster** than on its own, and up to 29% faster on the broadest one.
+
 More questions, scores and setup: [benchmarks](docs/benchmarks.md).
 
 ## See it
@@ -115,6 +117,7 @@ The first start downloads the embedding model (about 130 MB). After that, search
   ```bash
   claude mcp add --transport http lore "$LORE_URL/mcp" --header "Authorization: Bearer $LORE_KEY"
   ```
+  Then tell Claude to use it, with a line in `CLAUDE.md` such as "Start with lore to find the relevant code." [Why](docs/benchmarks.md#tell-claude-to-start-with-lore).
 - **Agent traces:** send OpenTelemetry GenAI spans to `/v1/traces`, and ask about past sessions.
 - **Notes and docs:** `lore doc put` indexes anything that isn't in a repo.
 
