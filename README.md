@@ -12,6 +12,22 @@ Written in Rust, MIT licensed. Status: version 0.1. Indexing, search, both answe
 
 Indexing and search need no model and, once the embedding model is downloaded, no network. Answers call a model, by default the Anthropic API, so they need the network: see [Runs offline?](#runs-offline).
 
+## At a glance: one question, three ways
+
+The question: "what's included in our entry-level billing plan?", asked of a private 1,816-file service. The plan is defined in a database seed migration, which lists 13 facts: price, included usage, overage rate, six limits, retention, audit logs, regions and one policy. Test files elsewhere in the repo repeat some of those values.
+
+| | lore fast | lore deep | Claude Code in a checkout |
+|---|---|---|---|
+| Time to answer | **4.9 s** | **13.3 s** | 28.0 s |
+| How it got there | one search, one model call | 4 tool calls | 5 turns of grep and read |
+| Found the seed migration | No. It answered from test files and said so | Yes | Yes |
+| Facts right, of 13 | 9 | **13** | **13** |
+| Facts wrong | 0 | 0 | 0, but it cited the wrong line (the next plan's row) |
+
+- **fast** gives a quick, cited answer that is only as good as its top 12 search hits. Here it said its values came from test files rather than the plan's definition, which was true.
+- **deep** searches until it finds the definition. It gave the same answer as Claude Code in under half the time.
+- All three used `claude-opus-5-5` on the same commit, run once each on 2026-10-22. Claude Code cost $0.27 for this question; lore's cost is not reported (see [lore vs Claude Code](#lore-vs-claude-code), which also has three more questions on a second repo).
+
 ## How it works
 
 lore works out where things are once, when they are indexed, instead of on every question. A question then costs one database query and, for an answer in prose, one model call.
