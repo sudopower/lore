@@ -127,7 +127,7 @@ prod-local-backup:
 prod-local-down:
 	$(COMPOSE_LOCAL) down -v
 
-# Kiran only. No factory station runs this.
+# Run by hand only: builds the image and deploys it to HOST over ssh. CI never runs it.
 deploy-prod:
 	@test -n "$(HOST)" -a -n "$(LORE_DOMAIN)" -a "$(VERSION)" != dev || { echo "usage: make deploy-prod HOST=root@<ip> LORE_DOMAIN=<domain> VERSION=<tag>"; exit 1; }
 	docker build --platform linux/arm64 --build-arg VERSION=$(VERSION) -t lore:$(VERSION) .
