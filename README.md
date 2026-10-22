@@ -86,7 +86,7 @@ What does lore add over pointing Claude Code at a checkout of the repo and askin
 
 The repo is a private 54-file Python service (an MCP server). lore indexed it, 54 files into 430 chunks, in 23 seconds.
 
-<!-- LARGE-REPO-INDEXING -->
+A larger private repo, a service of 1,816 files (mostly Go and SQL), took 35 minutes to index on the same laptop (Apple M2 Pro, 10 cores, 16 GB): 1,801 files into 22,796 chunks. lore used up to 7 cores and 3.7 GB of memory while it embedded, and nearly all of the time is the embedding model on the CPU. `lore repo push` stops waiting after 15 minutes and reports a timeout, but the server finishes the push anyway; `lore repo list` shows the new commit once it is done. Later pushes embed only the files that changed.
 
 lore and Postgres ran on an Apple Silicon laptop. Both sides used `claude-opus-5-5`. lore ran with its defaults: effort `low` in fast mode, `medium` in deep mode, 12 passages for a fast answer. Claude Code 2.1.304 ran as `claude -p "<question> Answer from this repository's code and cite file:line."` in a checkout of the repo, with only `Read`, `Grep` and `Glob` allowed (`--allowedTools`) and no MCP servers (`--strict-mcp-config`), so it could not use lore. "Retrieval only" is the median of 5 `GET /v1/search` calls (`k=12`) timed by curl: embedding the query, both index scans and the fusion, with no model call. The other times are wall-clock as each tool reports it, `latency_ms` from `/v1/ask` and `duration_ms` from Claude Code. The fast answers, the deep answers and the Claude Code runs started at the same time; the three deep questions ran one after another.
 
@@ -108,7 +108,7 @@ What this does not show:
 - It is one small repo. On a large one Claude Code has more to search, and fast mode's passages cover less of the code. Fast mode sees only its top `k` passages (12 by default) and can miss what does not rank there; deep mode, which can grep and read whole files, is the fallback.
 - lore answers from the last pushed commit and does not see uncommitted edits. Claude Code reads the working tree.
 - Claude Code can go on to edit the code and run commands. lore only answers.
-- Indexing is paid up front: 23 seconds for this repo, then only the changed files on each later push.
+- Indexing is paid up front: 23 seconds for this repo and 35 minutes for the 1,816-file one, then only the changed files on each later push.
 
 To run the comparison on your own repo, put one question per line in a file and run `scripts/bench_vs_claude_code.sh`:
 
