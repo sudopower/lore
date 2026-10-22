@@ -47,7 +47,7 @@ Indexing ran on an Apple M2 Pro (10 cores, 16 GB). Nearly all of the time goes t
 ## How these were measured
 
 - lore and Postgres ran on the same laptop. lore used its defaults: effort `low` for fast, `medium` for deep, 12 passages for a fast answer.
-- Claude Code 2.1.304 ran as `claude -p` from the repo's directory, reading the files on disk. For the 54-file service it had only `Read`, `Grep` and `Glob` (`--allowedTools`) and no MCP servers (`--strict-mcp-config`), so it could not use lore.
+- Claude Code 2.1.304 ran as `claude -p` from the repo's directory, reading the files on disk. It had its default tools, including Bash, Read and Grep. For the 54-file service it ran with no MCP servers (`--strict-mcp-config`), so it could not use lore.
 - Times are wall clock as each tool reports them: `latency_ms` from `/v1/ask`, `duration_ms` from Claude Code. Retrieval only is the median of 5 `GET /v1/search` calls.
 - Each cell is one run, taken on 2026-10-22.
 - Claude Code's cost is the `total_cost_usd` it reports. lore does not report its cost yet: `/v1/ask` returns only uncached input tokens, and a fast answer sends at most 60,000 characters of passages in one call.
