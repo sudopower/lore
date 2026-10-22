@@ -25,27 +25,31 @@ More questions, scores and setup: [benchmarks](docs/benchmarks.md).
 
 ## See it
 
+The auth question from the table, answered by fast mode in 7 seconds. The repos are private, so their names are changed.
+
 ```text
-$ lore repo push . --name lore              # index lore's own repo
-indexed lore at f8cd4b5: 105 indexed, 0 unchanged, 0 deleted, 2 skipped, 1523 chunks
+$ lore ask "how does auth work in control-plane ?"
 
-$ lore ask "how are search results ranked?" --source lore --kind code
+The control plane (cp-server) has exactly two security schemes and no API-key plane:
 
-Search results come from a hybrid search. Postgres full-text ranking, which is
-good at exact names, is fused with pgvector similarity, which is good at meaning,
-using Reciprocal Rank Fusion [9].
-
-- Two branches: a lexical branch and a vector branch each produce a ranked
-  list of chunk ids for the query [5].
-- Fusion score: an id earns 1 / (60 + rank) for each list it appears in [1].
+- Auth0 bearer JWT (bearerAuth) covers the whole user-facing surface:
+  identity, organizations, members, invitations and regions [6].
+- Internal service token (serviceToken) is the shared INTERNAL_SERVICE_TOKEN
+  used between the control plane and the regional servers. Operations that
+  list it admit nothing else, and no other operation admits it [6].
+- No apiKeyAuth. API keys are deliberately excluded, so a leaked workspace key
+  cannot reach tenancy management. A test enforces this [3].
+- What a key gets there: a workspace key sent to /v1/me is rejected with 401.
+  The MCP server, a second indexed repo, reads that 401 as "not a user" and
+  degrades instead of failing [12].
   ...
 
 Sources:
-[9] src/search.rs:1-18
-[5] src/search.rs:150-214
-[1] src/search.rs:322-356
+[6] apps/cp-server/internal/api/api.go:16-46
+[3] apps/cp-server/internal/api/spec_test.go:111-136
+[12] src/acme_mcp/controlplane.py:14-23
 ...
-claude-opus-5-5 · 5262 ms
+claude-opus-5-5 · 7000 ms
 ```
 
 ## Why lore
