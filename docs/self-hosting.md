@@ -37,7 +37,7 @@ make prod-local-down       # stops the stack and deletes its volumes
 Caddy blocks `/v1/admin`, so admin commands run on the server. The container already has `LORE_ADMIN_TOKEN` in its environment:
 
 ```sh
-ssh <host> 'cd /opt/lore && VERSION=<deployed tag> LORE_DOMAIN=<domain> docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name glassflow'
+ssh <host> 'cd /opt/lore && VERSION=<deployed tag> LORE_DOMAIN=<domain> docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name <tenant>'
 ```
 
 Everything else (`repo push`, `search`, `ask`, MCP) goes through `https://<domain>` with a tenant key.
