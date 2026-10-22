@@ -12,6 +12,19 @@ lore indexes your repos, docs and agent sessions once,<br>so every question star
 
 </div>
 
+## At a glance
+
+The same questions about a private 1,816-file service, asked of lore and of Claude Code exploring the repo on disk. Same model (`claude-opus-5-5`), same code.
+
+| Question | lore fast | lore deep | Claude Code |
+|---|---|---|---|
+| "What's included in our entry-level billing plan?" | **4.9 s** | **13.3 s** | 28.0 s |
+| "How does auth work in our control plane?" | **7.0 s** | 28.1 s | 22.3 s |
+
+More questions, scores and setup: [benchmarks](docs/benchmarks.md).
+
+## See it
+
 ```text
 $ lore ask "how are search results ranked?" --kind code
 
@@ -34,16 +47,9 @@ claude-opus-5-5 · 5262 ms
 
 ## Why lore
 
-An agent pointed at a checkout finds code the slow way: grep, read a file, grep again, with a model round trip at every step. lore does that work once, when you index. A question then costs a 20 ms search and a single model call.
+An agent working in a repo on disk finds code the slow way: grep, read a file, grep again, with a model round trip at every step. lore does that work once, when you index. A question then costs a 20 ms search and a single model call.
 
-On real repos that means answers in **5 to 8 seconds**, 3 to 7 times sooner than Claude Code exploring the same checkout. When you need the full picture, **deep** mode explores with tools and matched Claude Code on every question we scored.
-
-| Question on a 1,816-file service | lore fast | lore deep | Claude Code |
-|---|---|---|---|
-| "What's included in our entry-level billing plan?" | **4.9 s** | **13.3 s** | 28.0 s |
-| "How does auth work in our control plane?" | **7.0 s** | 28.1 s | 22.3 s |
-
-More questions, scores and setup: [benchmarks](docs/benchmarks.md).
+On real repos that means answers in **5 to 8 seconds**, 3 to 7 times sooner than Claude Code exploring the same repo. When you need the full picture, **deep** mode explores with tools and matched Claude Code on every question we scored.
 
 ## Two ways to ask
 

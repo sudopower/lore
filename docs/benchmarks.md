@@ -1,6 +1,6 @@
 # Benchmarks: lore vs Claude Code
 
-lore finds the relevant code once, when you index, so a question skips the grep-and-read loop. These runs compare that with Claude Code exploring a checkout, using the same model on both sides (`claude-opus-5-5`).
+lore finds the relevant code once, when you index, so a question skips the grep-and-read loop. These runs compare that with Claude Code exploring the repo on disk, using the same model on both sides (`claude-opus-5-5`).
 
 ## Highlights
 
@@ -19,7 +19,7 @@ Two questions about a private service, mostly Go and SQL. Each answer was scored
 
 fast gives a quick, cited summary built from the 12 passages search ranks highest. For the billing question it answered from test files that carry the plan's values. For the auth question it covered both credential kinds and the shared service token, and added how a second indexed repo, an MCP client, handles the control plane's 401. deep went on searching until it had the full picture: it found the plan's seed migration and every token type, with 4 and 12 tool calls.
 
-Claude Code ran in a checkout with effort `medium` for the billing question and `low` for the auth question. For the auth question it read a commit 21 commits newer than lore's index, with no change to the auth code.
+Claude Code ran in a copy of the repo on disk, with effort `medium` for the billing question and `low` for the auth question. For the billing question that copy was a clone at the commit lore indexed. For the auth question it was a working copy on another branch, so Claude Code read `origin/main` through git instead: 21 commits newer than lore's index, with no change to the auth code.
 
 ## A 54-file service
 
@@ -47,7 +47,7 @@ Indexing ran on an Apple M2 Pro (10 cores, 16 GB). Nearly all of the time goes t
 ## How these were measured
 
 - lore and Postgres ran on the same laptop. lore used its defaults: effort `low` for fast, `medium` for deep, 12 passages for a fast answer.
-- Claude Code 2.1.304 ran as `claude -p` in a checkout of the repo. For the 54-file service it had only `Read`, `Grep` and `Glob` (`--allowedTools`) and no MCP servers (`--strict-mcp-config`), so it could not use lore.
+- Claude Code 2.1.304 ran as `claude -p` from the repo's directory, reading the files on disk. For the 54-file service it had only `Read`, `Grep` and `Glob` (`--allowedTools`) and no MCP servers (`--strict-mcp-config`), so it could not use lore.
 - Times are wall clock as each tool reports them: `latency_ms` from `/v1/ask`, `duration_ms` from Claude Code. Retrieval only is the median of 5 `GET /v1/search` calls.
 - Each cell is one run, taken on 2026-10-22.
 - Claude Code's cost is the `total_cost_usd` it reports. lore does not report its cost yet: `/v1/ask` returns only uncached input tokens, and a fast answer sends at most 60,000 characters of passages in one call.
