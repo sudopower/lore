@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 /// Runtime configuration. All settings come from `LORE_*` environment variables.
-/// Every later ticket adds its variables here, and to the README table.
+/// Every later ticket adds its variables here, and to the table in docs/configuration.md.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
