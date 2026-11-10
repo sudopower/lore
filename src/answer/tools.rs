@@ -706,6 +706,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             score: 0.0,
+            later_changes: Vec::new(),
         }
     }
 

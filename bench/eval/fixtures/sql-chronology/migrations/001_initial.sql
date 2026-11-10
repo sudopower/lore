@@ -1,0 +1,12 @@
+CREATE TABLE accounts (status text CHECK (status IN ('pending', 'active', 'locked', 'closed', 'trial', 'paused')));
+CREATE TYPE shipment_stage AS ENUM ('queued', 'sent');
+CREATE TABLE retired_devices (state text CHECK (state IN ('online', 'offline')));
+CREATE TABLE audit.accounts (status text CHECK (status IN ('recorded', 'sealed')));
+CREATE TABLE app."device_state" (state text CHECK (state IN ('ready', 'busy')));
+CREATE TABLE plans (tier text CHECK (tier IN ('free', 'pro')));
+CREATE TABLE public."event.log" (level text CHECK (level IN ('info', 'error')));
+CREATE TABLE event.log (level text CHECK (level IN ('debug', 'trace')));
+CREATE TYPE processing_state AS ENUM ('waiting', 'running');
+CREATE TABLE processing_state (value text CHECK (value IN ('fresh', 'stale')));
+CREATE TABLE lexical_order (mode text CHECK (mode IN ('original', 'initial')));
+CREATE TABLE app."Device_State" (state text CHECK (state IN ('special', 'private')));

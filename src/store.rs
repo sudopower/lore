@@ -403,13 +403,21 @@ async fn insert_chunk(
     c: &IndexedChunk,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO chunks
+        "WITH added AS (INSERT INTO chunks
            (tenant_id, document_id, ord, text, start_line, end_line, symbols, tsv, embedding,
-            enumerates)
+            enumerates, sql_subjects)
          VALUES ($1, $2, $3, $4, $5, $6, $7,
                  setweight(to_tsvector('english', $8::text), 'A')
                    || setweight(to_tsvector('english', $9::text), 'B'),
-                 $10, $11)",
+                 $10, $11, $12)
+         RETURNING id)
+         INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, path, ord)
+         SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, d.metadata->>'path', $3
+         FROM added
+         JOIN documents d ON d.id = $2
+         CROSS JOIN unnest($12::text[], $13::text[]) AS subjects(subject, identity)
+         WHERE d.metadata->>'path' IS NOT NULL
+           AND octet_length(d.metadata->>'path') <= 2048",
     )
     .bind(tenant_id)
     .bind(document_id)
@@ -422,6 +430,8 @@ async fn insert_chunk(
     .bind(&c.lexical)
     .bind(Vector::from(c.embedding.clone()))
     .bind(c.chunk.enumerates)
+    .bind(&c.chunk.sql_subjects)
+    .bind(&c.chunk.sql_identities)
     .execute(conn)
     .await?;
     Ok(())

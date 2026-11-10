@@ -18,7 +18,7 @@ pub use markdown::{chunk_markdown, chunk_markdown_split};
 /// Part of the stored hash of every repo file. Bump it whenever [`chunk_file`] chunks some file
 /// differently, so that `lore repo push --full` chunks files indexed by an older version again
 /// instead of skipping them as unchanged.
-pub const CHUNKER_VERSION: u32 = 2;
+pub const CHUNKER_VERSION: u32 = 3;
 
 /// Chunks are cut to this many characters (not bytes) so one huge line cannot blow up a row.
 /// [`chunk_markdown_split`] sizes its chunks to fit, so the cut never loses text there.
@@ -47,6 +47,10 @@ pub struct Chunk {
     /// seed rows, a `CHECK ... IN` list. Search ranks these on their own as well, because "which X
     /// are there" is answered by one of them and is easily outranked by code that only uses X.
     pub enumerates: bool,
+    /// Case-folded, schema-qualified SQL object identities. Empty for other languages.
+    pub sql_subjects: Vec<String>,
+    /// Parallel canonical identities preserve quoted case for SQL object matching.
+    pub sql_identities: Vec<String>,
 }
 
 impl Chunk {
@@ -65,6 +69,8 @@ impl Chunk {
             symbols,
             kind,
             enumerates: false,
+            sql_subjects: Vec::new(),
+            sql_identities: Vec::new(),
         }
     }
 

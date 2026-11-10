@@ -68,6 +68,8 @@ fn chunk(text: &str, start: u32, end: u32, symbols: &[&str]) -> Chunk {
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         kind: ChunkKind::Lines,
         enumerates: false,
+        sql_subjects: Vec::new(),
+        sql_identities: Vec::new(),
     }
 }
 

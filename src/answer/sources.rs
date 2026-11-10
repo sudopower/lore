@@ -88,6 +88,10 @@ fn bullet(n: usize, h: &Hit, terms: &[String]) -> String {
     if let Some(line) = best_line(&h.text, terms) {
         out.push_str(&format!(" — `{}`", line.replace('`', "'")));
     }
+    if let Some(note) = h.sql_change_note() {
+        out.push_str("; ");
+        out.push_str(&note);
+    }
     out
 }
 
@@ -146,6 +150,7 @@ mod tests {
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
             text: text.to_string(),
             score: 0.03,
+            later_changes: Vec::new(),
         }
     }
 

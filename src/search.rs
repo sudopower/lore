@@ -7,7 +7,7 @@
 //! Queries are runtime-checked and bind every value. The one built string is the tsquery text of
 //! the lexical branch, which is itself passed as a bind value.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -99,6 +99,23 @@ pub struct Hit {
     pub text: String,
     /// The Reciprocal Rank Fusion score: higher is better.
     pub score: f64,
+    /// A later SQL migration names the same object. Internal answer annotation, not a wire field.
+    pub later_changes: Vec<String>,
+}
+
+impl Hit {
+    pub fn sql_change_note(&self) -> Option<String> {
+        if self.later_changes.is_empty() {
+            return None;
+        }
+        let paths = self
+            .later_changes
+            .iter()
+            .map(|path| format!("`{}`", path.replace(['`', '\n', '\r'], "'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("later SQL changes in {paths}"))
+    }
 }
 
 /// The columns of a hit, plus what `uri` is rendered from.
@@ -151,6 +168,7 @@ impl HitRow {
             symbols: self.symbols,
             text: self.text,
             score,
+            later_changes: Vec::new(),
         }
     }
 }
@@ -225,6 +243,8 @@ pub async fn search(
         return Ok(Vec::new());
     }
 
+    let (fused, later_changes) = sql_changes(pool, fused, &filter, k).await?;
+
     // One query for all rows; the tenant filter applies here too. Rows come back in any order,
     // so they are put in the fused order afterwards.
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
@@ -247,8 +267,98 @@ pub async fn search(
     // A chunk deleted since the branches ran is simply missing.
     Ok(fused
         .into_iter()
-        .filter_map(|(id, score)| by_id.remove(&id).map(|row| row.into_hit(score)))
+        .filter_map(|(id, score)| {
+            by_id.remove(&id).map(|row| {
+                let mut hit = row.into_hit(score);
+                hit.later_changes = later_changes.get(&id).cloned().unwrap_or_default();
+                hit
+            })
+        })
         .collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct SqlChange {
+    origin: i64,
+    id: i64,
+    path: String,
+}
+
+/// Add the newest migration for each retrieved SQL subject, before the older evidence. The
+/// source id, tenant and kind remain fixed. Paths use bytewise ordering, not locale, timestamps,
+/// natural-number ordering or ingestion order. Each subject contributes at most one companion.
+async fn sql_changes(
+    pool: &PgPool,
+    fused: Vec<(i64, f64)>,
+    f: &Filter<'_>,
+    k: usize,
+) -> Result<(Vec<(i64, f64)>, HashMap<i64, Vec<String>>), AppError> {
+    let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let changes: Vec<SqlChange> = sqlx::query_as(
+        "SELECT base.id AS origin, latest.id, latest.path
+         FROM chunks base
+         JOIN documents original ON original.id = base.document_id
+         JOIN sql_subject_lookup original_subject ON original_subject.chunk_id = base.id
+         CROSS JOIN LATERAL (
+             SELECT entry.chunk_id AS id, entry.path
+             FROM sql_subject_lookup entry
+             WHERE entry.tenant_id = $2
+               AND entry.source_id = original.source_id AND entry.kind = original.kind
+               AND entry.identity = original_subject.identity
+               AND entry.path >
+                   (original.metadata->>'path') COLLATE \"C\"
+             ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+             LIMIT 1
+         ) latest
+         WHERE base.id = ANY($1) AND base.tenant_id = $2
+         ORDER BY origin, path COLLATE \"C\" DESC, id",
+    )
+    .bind(&ids)
+    .bind(f.tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(promote_sql(fused, &changes, k))
+}
+
+fn promote_sql(
+    fused: Vec<(i64, f64)>,
+    changes: &[SqlChange],
+    k: usize,
+) -> (Vec<(i64, f64)>, HashMap<i64, Vec<String>>) {
+    let mut by_origin: HashMap<i64, Vec<&SqlChange>> = HashMap::new();
+    let mut annotations: HashMap<i64, Vec<String>> = HashMap::new();
+    for change in changes {
+        by_origin.entry(change.origin).or_default().push(change);
+        let paths = annotations.entry(change.origin).or_default();
+        if !paths.contains(&change.path) {
+            paths.push(change.path.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (id, score) in fused {
+        // A companion can itself be an older retrieved hit (a grouped chunk may name several
+        // subjects). Expand its known changes first too, so promoting it cannot reverse time.
+        let mut stack = vec![(id, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            if expanded {
+                seen.insert(id);
+                out.push((id, score));
+                if out.len() == k {
+                    return (out, annotations);
+                }
+            } else {
+                stack.push((id, true));
+                if let Some(changes) = by_origin.get(&id) {
+                    stack.extend(changes.iter().rev().map(|change| (change.id, false)));
+                }
+            }
+        }
+    }
+    (out, annotations)
 }
 
 /// The filters both branches share.
@@ -465,6 +575,31 @@ mod tests {
         assert_eq!(clamp_k(50), 50);
         assert_eq!(clamp_k(51), 50);
         assert_eq!(clamp_k(usize::MAX), 50);
+    }
+
+    #[test]
+    fn sql_companions_are_newest_first_unique_and_bounded() {
+        let changes = [
+            SqlChange {
+                origin: 1,
+                id: 2,
+                path: "002.sql".into(),
+            },
+            SqlChange {
+                origin: 2,
+                id: 3,
+                path: "003.sql".into(),
+            },
+        ];
+        let fused = vec![(1, 0.03), (2, 0.02), (3, 0.01), (4, 0.005)];
+        let (hits, notes) = promote_sql(fused.clone(), &changes, 5);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [3, 2, 1, 4]
+        );
+        assert_eq!(notes[&1], ["002.sql"]);
+        assert_eq!(notes[&2], ["003.sql"]);
+        assert_eq!(promote_sql(fused, &changes, 1).0, [(3, 0.03)]);
     }
 
     #[test]

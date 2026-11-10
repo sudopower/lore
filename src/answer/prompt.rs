@@ -6,7 +6,10 @@ use crate::search::Hit;
 pub const FAST_SYSTEM: &str = "You answer questions about a team's code, documents and agent sessions. \
 Use only the numbered sources. Cite every claim with its source number in square brackets, like [2]. \
 If the sources do not contain the answer, say so and say what is missing. \
-Answer in at most 8 short sentences or a short list. Count carefully when asked how many.";
+Answer in at most 8 short sentences or a short list. Count carefully when asked how many. \
+SQL sources marked with later changes are historical evidence: read the later migrations before \
+stating current values. A later change may add values or remove the object; do not treat the \
+original definition alone as current.";
 
 /// The system prompt of deep mode. The model finds its own evidence with the tools and cites
 /// code as `[path:start-end]` (the path without the source prefix) and sessions as `[session:<id>]`.
@@ -23,13 +26,16 @@ const PREFIX: &str = "Sources:\n\n";
 
 /// One numbered source: a header line, then the text in a fence cut to its first 120 lines.
 fn render_source(n: usize, hit: &Hit) -> String {
-    let header = match (&hit.path, hit.start_line, hit.end_line) {
+    let mut header = match (&hit.path, hit.start_line, hit.end_line) {
         (Some(path), Some(start), Some(end)) => {
             format!("[{n}] {path}:{start}-{end} ({})", hit.kind)
         }
         (Some(path), _, _) => format!("[{n}] {path} ({})", hit.kind),
         (None, _, _) => format!("[{n}] {} ({})", hit.title, hit.kind),
     };
+    if let Some(note) = hit.sql_change_note() {
+        header.push_str(&format!("; {note}"));
+    }
     let text = hit
         .text
         .lines()
@@ -81,6 +87,7 @@ mod tests {
             symbols: Vec::new(),
             text: text.to_string(),
             score: 0.03,
+            later_changes: Vec::new(),
         }
     }
 
