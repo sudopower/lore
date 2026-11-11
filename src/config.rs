@@ -50,6 +50,17 @@ pub struct Config {
     pub deep_concurrency: usize,
     /// `LORE_DEEP_DAILY_LIMIT`: how many deep-mode questions one tenant may ask per UTC day.
     pub deep_daily_limit: u32,
+    /// `LORE_SYNC_INTERVAL_SECS`: how often every repo with a remote is fetched and indexed.
+    /// `None` (unset or 0) turns the poller off.
+    pub sync_interval_secs: Option<u64>,
+    /// `LORE_GITHUB_WEBHOOK_SECRET`: the secret GitHub signs webhook deliveries with. `None`
+    /// (unset or empty) turns the webhook endpoint off.
+    pub github_webhook_secret: Option<String>,
+    /// `LORE_SYNC_ALLOW_FILE_REMOTES`: accept `file://` remote URLs. For tests and local
+    /// experiments only: it lets any ingest key make the server read a git repo on its host.
+    pub sync_allow_file_remotes: bool,
+    /// `LORE_EMBEDDING_CACHE`: who may reuse a vector another document already paid for.
+    pub embedding_cache: EmbeddingCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +74,18 @@ pub enum LlmKind {
 pub enum LogFormat {
     Text,
     Json,
+}
+
+/// Scope of the embedding cache (`LORE_EMBEDDING_CACHE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingCache {
+    /// One cache for the whole server: a text embedded for any tenant is reused by every tenant.
+    /// A push is faster when its text exists elsewhere, which is the only signal it gives away.
+    Shared,
+    /// One cache per tenant: no tenant's indexing time depends on another tenant's content.
+    Tenant,
+    /// No cache: only the chunks a document already holds keep their vectors.
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +158,14 @@ impl Config {
             "hash" => EmbedderKind::Hash,
             other => bail!("LORE_EMBEDDER must be \"fastembed\" or \"hash\", got {other:?}"),
         };
+        let embedding_cache = match get("LORE_EMBEDDING_CACHE", "shared").as_str() {
+            "shared" => EmbeddingCache::Shared,
+            "tenant" => EmbeddingCache::Tenant,
+            "off" => EmbeddingCache::Off,
+            other => bail!(
+                "LORE_EMBEDDING_CACHE must be \"shared\", \"tenant\" or \"off\", got {other:?}"
+            ),
+        };
         let embed_model = get("LORE_EMBED_MODEL", EMBED_MODEL);
         if embed_model != EMBED_MODEL {
             bail!(
@@ -170,6 +201,22 @@ impl Config {
         let deep_max_rounds = positive(&f, "LORE_DEEP_MAX_ROUNDS", DEFAULT_DEEP_MAX_ROUNDS)?;
         let deep_concurrency = positive(&f, "LORE_DEEP_CONCURRENCY", DEFAULT_DEEP_CONCURRENCY)?;
         let deep_daily_limit = positive(&f, "LORE_DEEP_DAILY_LIMIT", DEFAULT_DEEP_DAILY_LIMIT)?;
+
+        let sync_interval_secs = match f("LORE_SYNC_INTERVAL_SECS") {
+            None => None,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => {
+                    bail!("LORE_SYNC_INTERVAL_SECS must be a non-negative integer, got {v:?}")
+                }
+            },
+        };
+        let sync_allow_file_remotes = match get("LORE_SYNC_ALLOW_FILE_REMOTES", "false").trim() {
+            "true" | "1" => true,
+            "false" | "0" | "" => false,
+            other => bail!("LORE_SYNC_ALLOW_FILE_REMOTES must be true or false, got {other:?}"),
+        };
 
         let llm = match get("LORE_LLM", "anthropic").as_str() {
             "anthropic" => LlmKind::Anthropic,
@@ -221,6 +268,10 @@ impl Config {
             deep_max_rounds,
             deep_concurrency,
             deep_daily_limit,
+            sync_interval_secs,
+            github_webhook_secret: f("LORE_GITHUB_WEBHOOK_SECRET").filter(|s| !s.is_empty()),
+            sync_allow_file_remotes,
+            embedding_cache,
         })
     }
 }
@@ -281,6 +332,38 @@ mod tests {
         assert_eq!(c.deep_max_rounds, 12);
         assert_eq!(c.deep_concurrency, 2);
         assert_eq!(c.deep_daily_limit, 100);
+        assert_eq!(c.sync_interval_secs, None);
+        assert_eq!(c.github_webhook_secret, None);
+        assert!(!c.sync_allow_file_remotes);
+        assert_eq!(c.embedding_cache, EmbeddingCache::Shared);
+    }
+
+    #[test]
+    fn sync_settings_are_read() {
+        let c = lookup(&[
+            ("LORE_SYNC_INTERVAL_SECS", " 300 "),
+            ("LORE_GITHUB_WEBHOOK_SECRET", "s3cret"),
+            ("LORE_SYNC_ALLOW_FILE_REMOTES", "true"),
+        ])
+        .unwrap();
+        assert_eq!(c.sync_interval_secs, Some(300));
+        assert_eq!(c.github_webhook_secret.as_deref(), Some("s3cret"));
+        assert!(c.sync_allow_file_remotes);
+        let c = lookup(&[
+            ("LORE_SYNC_INTERVAL_SECS", "0"),
+            ("LORE_GITHUB_WEBHOOK_SECRET", ""),
+        ])
+        .unwrap();
+        assert_eq!(c.sync_interval_secs, None);
+        assert_eq!(c.github_webhook_secret, None);
+        for (key, bad) in [
+            ("LORE_SYNC_INTERVAL_SECS", "-1"),
+            ("LORE_SYNC_INTERVAL_SECS", "soon"),
+            ("LORE_SYNC_ALLOW_FILE_REMOTES", "yes"),
+        ] {
+            let err = lookup(&[(key, bad)]).unwrap_err();
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]
@@ -429,6 +512,20 @@ mod tests {
     fn bad_log_format_is_an_error() {
         let err = lookup(&[("LORE_LOG_FORMAT", "yaml")]).unwrap_err();
         assert!(err.to_string().contains("LORE_LOG_FORMAT"), "{err}");
+    }
+
+    #[test]
+    fn embedding_cache_is_read() {
+        for (v, want) in [
+            ("shared", EmbeddingCache::Shared),
+            ("tenant", EmbeddingCache::Tenant),
+            ("off", EmbeddingCache::Off),
+        ] {
+            let c = lookup(&[("LORE_EMBEDDING_CACHE", v)]).unwrap();
+            assert_eq!(c.embedding_cache, want);
+        }
+        let err = lookup(&[("LORE_EMBEDDING_CACHE", "global")]).unwrap_err();
+        assert!(err.to_string().contains("LORE_EMBEDDING_CACHE"), "{err}");
     }
 
     #[test]
