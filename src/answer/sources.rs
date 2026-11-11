@@ -77,6 +77,9 @@ fn bullet(n: usize, h: &Hit, terms: &[String]) -> String {
         (None, _, _) => h.title.clone(),
     };
     let mut out = format!("- [{n}] `{}` ({})", place.replace('`', "'"), h.source);
+    if !h.also_in.is_empty() {
+        out.push_str(&format!("; also in: {}", h.also_in.join(", ")));
+    }
     if !h.symbols.is_empty() {
         let mut symbols = h.symbols[..h.symbols.len().min(BULLET_SYMBOLS)].join(", ");
         if h.symbols.len() > BULLET_SYMBOLS {
@@ -136,6 +139,7 @@ mod tests {
             chunk_id: 1,
             document_id: Uuid::nil(),
             source: "sample".to_string(),
+            also_in: Vec::new(),
             kind: "code".to_string(),
             title: "Standup notes".to_string(),
             uri: Some("https://git.example.com/x".to_string()),
@@ -151,6 +155,13 @@ mod tests {
 
     fn terms(q: &str) -> Vec<String> {
         query_terms(q)
+    }
+
+    #[test]
+    fn duplicate_sources_are_named_in_sources_answers() {
+        let mut h = hit(Some("gen/agent.py"), &[], "");
+        h.also_in = vec!["sdk".to_string()];
+        assert!(bullet(1, &h, &[]).contains("; also in: sdk"));
     }
 
     #[test]

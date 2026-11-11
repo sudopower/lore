@@ -326,6 +326,9 @@ fn render_hit(hit: &Hit) -> String {
         }
         (None, _) => format!("doc:{} ({})", hit.document_id, hit.title),
     };
+    if !hit.also_in.is_empty() {
+        out.push_str(&format!("; also in: {}", hit.also_in.join(", ")));
+    }
     for line in hit.text.lines().take(HIT_LINES) {
         out.push('\n');
         out.push_str(line);
@@ -693,6 +696,7 @@ mod tests {
             chunk_id: 1,
             document_id: Uuid::nil(),
             source: "sample".to_string(),
+            also_in: Vec::new(),
             kind: kind.to_string(),
             title: "A title".to_string(),
             uri: None,
@@ -757,6 +761,13 @@ mod tests {
 
         let note = render_hit(&hit(None, "note", None));
         assert!(note.starts_with(&format!("doc:{} (A title)\n", Uuid::nil())));
+    }
+
+    #[test]
+    fn search_passages_name_duplicate_sources() {
+        let mut h = hit(Some("gen/agent.py"), "code", None);
+        h.also_in = vec!["sdk".to_string()];
+        assert!(render_hit(&h).contains("; also in: sdk"));
     }
 
     #[test]

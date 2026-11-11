@@ -82,6 +82,8 @@ def parse_set(data, path="<set>"):
         seen.add(q["id"])
         if q["category"] not in CATEGORIES:
             raise ValueError(f"{where}: category must be one of {', '.join(CATEGORIES)}")
+        if "unscoped" in q and not isinstance(q["unscoped"], bool):
+            raise ValueError(f"{where}: unscoped must be a boolean")
         q.setdefault("need", "any")
         if q["need"] not in NEEDS:
             raise ValueError(f"{where}: need must be any or all")
@@ -177,7 +179,10 @@ def get_json(url, key=None, timeout=60):
 
 def search(url, key, q, source, k=SEARCH_K):
     """One search. Returns (hits, milliseconds)."""
-    params = urllib.parse.urlencode({"q": q, "k": k, "source": source})
+    params = {"q": q, "k": k}
+    if source is not None:
+        params["source"] = source
+    params = urllib.parse.urlencode(params)
     start = time.perf_counter()
     body = get_json(f"{url.rstrip('/')}/v1/search?{params}", key)
     return body["hits"], (time.perf_counter() - start) * 1000
@@ -209,16 +214,17 @@ def run(label, url, key, paths, out_dir=None, log=print):
         info = get_json(f"{url.rstrip('/')}/v1/info")
     except Exception as e:  # noqa: BLE001 - the eval still runs against an older server
         info = {"error": str(e)}
-    # The first search pays for warm-up (connections, the embedder's first call); not timed.
-    search(url, key, questions[0]["q"], questions[0]["repo"])
+    # Report first-call cost separately; exclude it from the steady-state median.
+    _, warmup_ms = search(url, key, questions[0]["q"],
+                          None if questions[0].get("unscoped") else questions[0]["repo"])
 
     rows = []
     for q in questions:
-        hits, ms = search(url, key, q["q"], q["repo"])
+        hits, ms = search(url, key, q["q"], None if q.get("unscoped") else q["repo"])
         rank = question_rank(hits, q)
         rows.append({
             "id": q["id"], "repo": q["repo"], "category": q["category"], "need": q["need"],
-            "q": q["q"], "rank": rank,
+            "q": q["q"], "rank": rank, "unscoped": q.get("unscoped", False),
             "gold_ranks": [gold_rank(hits, q["repo"], g) for g in q["gold"]],
             "latency_ms": round(ms, 1),
             "top": [short_hit(h) for h in hits[:5]],
@@ -233,6 +239,8 @@ def run(label, url, key, paths, out_dir=None, log=print):
         "server": info,
         "sets": sets,
         "latency_ms_median": median([r["latency_ms"] for r in rows]),
+        "latency_ms_first": round(warmup_ms, 1),
+        "latency_ms_max": max([round(warmup_ms, 1)] + [r["latency_ms"] for r in rows]),
         "summary": summary_of(rows),
         "questions": rows,
     }

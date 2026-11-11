@@ -257,6 +257,31 @@ class Run(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             retrieval.run("t", self.url, "lk_wrong", [path], out_dir=self.tmp, log=lambda *_: None)
 
+    def test_unscoped_omits_source_but_still_scores_gold_source(self):
+        q = question([{"path": "src/a.rs", "start": 20, "end": 20}])
+        q["unscoped"] = True
+        path = os.path.join(self.tmp, "set.json")
+        with open(path, "w") as f:
+            json.dump([q], f)
+        res, _ = retrieval.run("unscoped", self.url, "lk_test", [path],
+                               out_dir=self.tmp, log=lambda *_: None)
+        self.assertEqual(res["questions"][0]["rank"], 2)
+        self.assertTrue(res["questions"][0]["unscoped"])
+        self.assertTrue(all("source" not in p for p in FakeLore.seen))
+        q["repo"] = "wrong-source"
+        self.assertIsNone(retrieval.question_rank(FakeLore.seen, q))
+
+    def test_multirepo_gold_ranges_exist_in_the_fixed_corpus(self):
+        with open(os.path.join(HERE, "testdata", "multirepo.json")) as f:
+            corpus = json.load(f)["sources"]
+        _, questions = retrieval.load_set(os.path.join(HERE, "questions", "multirepo.json"))
+        self.assertEqual(len(questions), 15)
+        self.assertTrue(all(q["unscoped"] for q in questions))
+        for q in questions:
+            for gold in q["gold"]:
+                lines = corpus[q["repo"]][gold["path"]].splitlines()
+                self.assertLessEqual(gold["end"], len(lines), q["id"])
+
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class Check(unittest.TestCase):

@@ -31,6 +31,8 @@ pub struct SearchArgs {
 /// The parts of a hit the plain output uses.
 #[derive(Deserialize)]
 struct Hit {
+    #[serde(default)]
+    also_in: Vec<String>,
     kind: String,
     title: String,
     path: Option<String>,
@@ -91,6 +93,9 @@ fn format_hit(hit: &Hit) -> String {
         head.push_str(&hit.symbols.join(", "));
     }
     let mut out = format!("{head}\n");
+    if !hit.also_in.is_empty() {
+        out.push_str(&format!("    also in: {}\n", hit.also_in.join(", ")));
+    }
     for line in hit.snippet.lines().take(SNIPPET_LINES) {
         out.push_str(format!("    {line}").trim_end());
         out.push('\n');
@@ -104,6 +109,7 @@ mod tests {
 
     fn hit() -> Hit {
         Hit {
+            also_in: Vec::new(),
             kind: "code".to_string(),
             title: "Standup notes".to_string(),
             path: Some("src/billing/plans.rs".to_string()),
@@ -122,6 +128,19 @@ mod tests {
             "src/billing/plans.rs:7-14  (score 0.033)  limits, Plan::limits\n    \
              /// Returns the limits.\n    pub fn limits() {\n        body\n"
         );
+    }
+
+    #[test]
+    fn duplicate_sources_are_printed_and_old_servers_still_deserialize() {
+        let mut h = hit();
+        h.also_in = vec!["sdk-one".to_string(), "sdk-two".to_string()];
+        assert!(format_hit(&h).contains("also in: sdk-one, sdk-two\n"));
+        let wire = serde_json::json!({
+            "kind": "code", "title": "a", "path": null, "start_line": null,
+            "end_line": null, "symbols": [], "snippet": "body", "score": 0.1
+        });
+        let old: Hit = serde_json::from_value(wire).unwrap();
+        assert!(old.also_in.is_empty());
     }
 
     #[test]
