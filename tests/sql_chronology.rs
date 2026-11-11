@@ -1,7 +1,10 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{create_tenant_key, send, test_router, test_state};
+use common::{
+    bundle, create_repo, create_tenant_key, fixture_repo, git, head, put_bundle, send, test_router,
+    test_state,
+};
 use lore::chunk::chunk_file;
 use lore::http::AppState;
 use lore::search::{Hit, SearchQuery, search};
@@ -379,4 +382,216 @@ async fn lookup_rows_replace_delete_and_rollback_with_chunks(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(remaining, 0);
+}
+
+fn random_ascii(len: usize) -> String {
+    let mut value = String::new();
+    while value.len() < len {
+        value.push_str(&Uuid::new_v4().simple().to_string());
+    }
+    value.truncate(len);
+    value
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn long_identity_and_path_boundaries_keep_chronology_complete(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let router = test_router(state.clone());
+    for identity_bytes in [256, 257, 4096] {
+        for path_bytes in [2048, 2049, 16384] {
+            let name = random_ascii(identity_bytes - "table:\"public\".\"\"".len());
+            let create = format!(
+                "CREATE TABLE \"{name}\" (state text CHECK (state IN ('open', 'closed')));"
+            );
+            assert_eq!(
+                chunk_file("000.sql", &create)[0].sql_identities[0].len(),
+                identity_bytes
+            );
+            let (tenant, _) = create_tenant_key(
+                &router,
+                &format!("bounds-{identity_bytes}-{path_bytes}"),
+                &["read"],
+            )
+            .await;
+            let latest = format!("z/{}.sql", random_ascii(path_bytes - 6));
+            assert_eq!(latest.len(), path_bytes);
+            sql(&state, tenant, "app", "000.sql", &create).await;
+            sql(
+                &state,
+                tenant,
+                "app",
+                &latest,
+                &format!("ALTER TABLE \"{name}\" ADD COLUMN latest_marker int;"),
+            )
+            .await;
+            let hits = find(&state, tenant, "what are the current state values?", 5).await;
+            assert_eq!(hits.len(), 2, "{identity_bytes}/{path_bytes}: {hits:?}");
+            assert!(
+                hits[0].text.contains("latest_marker"),
+                "{identity_bytes}/{path_bytes}"
+            );
+            assert_eq!(hits[1].later_changes, [latest]);
+            sqlx::query("DELETE FROM tenants WHERE id = $1")
+                .bind(tenant)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let left: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM sql_subject_lookup WHERE tenant_id = $1")
+                    .bind(tenant)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(left, 0);
+        }
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn subjects_after_sixty_four_and_hash_collisions_do_not_lose_or_mislink_changes(
+    pool: PgPool,
+) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let router = test_router(state.clone());
+    for count in [64, 65, 100] {
+        let (tenant, _) = create_tenant_key(&router, &format!("subjects-{count}"), &["read"]).await;
+        let create = (0..count)
+            .map(|i| format!("CREATE TABLE t{i} (state text); "))
+            .collect::<String>();
+        sql(&state, tenant, "app", "001.sql", &create).await;
+        sql(
+            &state,
+            tenant,
+            "app",
+            "002.sql",
+            &format!("ALTER TABLE t{} ADD COLUMN latest int;", count - 1),
+        )
+        .await;
+        let hits = find(&state, tenant, "what state columns are there?", 5).await;
+        assert_eq!(hits[0].path.as_deref(), Some("002.sql"));
+        assert_eq!(hits[1].later_changes, ["002.sql"]);
+    }
+    let (tenant, _) = create_tenant_key(&router, "collisions", &["read"]).await;
+    sql(&state, tenant, "app", "001.sql", CREATE).await;
+    sql(
+        &state,
+        tenant,
+        "app",
+        "002.sql",
+        "ALTER TABLE unrelated ADD COLUMN x int;",
+    )
+    .await;
+    let overflow = format!("z/{}.sql", random_ascii(2049));
+    sql(
+        &state,
+        tenant,
+        "app",
+        &overflow,
+        "ALTER TABLE unrelated ADD COLUMN y int;",
+    )
+    .await;
+    // Deliberately force equal hash buckets. Full identity equality, not hash equality, decides.
+    sqlx::query("UPDATE sql_subject_lookup SET identity_hash = (SELECT identity_hash FROM sql_subject_lookup WHERE tenant_id = $1 AND identity = 'table:\"public\".\"accounts\"' LIMIT 1) WHERE tenant_id = $1")
+        .bind(tenant).execute(&state.pool).await.unwrap();
+    let hits = find(&state, tenant, "account statuses", 5).await;
+    let original = hits
+        .iter()
+        .find(|h| h.path.as_deref() == Some("001.sql"))
+        .unwrap();
+    assert!(original.later_changes.is_empty(), "{hits:?}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn real_bundle_ingest_accepts_and_surfaces_a_long_git_path(pool: PgPool) {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(pool, data.path());
+    let router = test_router(state.clone());
+    let (tenant, key) = create_tenant_key(&router, "long-git-path", &["ingest", "read"]).await;
+    let repo = fixture_repo();
+    let long = format!(
+        "migrations/z{}.sql",
+        random_ascii(16384 - "migrations/z.sql".len())
+    );
+    for (path, text) in [("migrations/001.sql", CREATE), (long.as_str(), ALTER)] {
+        let file = data.path().join("ddl.sql");
+        std::fs::write(&file, text).unwrap();
+        let blob = git(&repo, &["hash-object", "-w", file.to_str().unwrap()]);
+        let entry = format!("100644,{},{}", blob.trim(), path);
+        git(&repo, &["update-index", "--add", "--cacheinfo", &entry]);
+    }
+    let tree = git(&repo, &["write-tree"]);
+    let commit = git(
+        &repo,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            &head(&repo),
+            "-m",
+            "Add SQL chronology paths",
+        ],
+    );
+    git(&repo, &["update-ref", "HEAD", commit.trim()]);
+    let (status, source) = create_repo(&router, &key, "app").await;
+    assert_eq!(status, StatusCode::OK);
+    let source_id: Uuid = source["id"].as_str().unwrap().parse().unwrap();
+    let (status, report) = put_bundle(
+        &router,
+        &key,
+        source_id,
+        bundle(&repo, &["HEAD"]),
+        &head(&repo),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let hits = find(&state, tenant, "which statuses can an account be in?", 5).await;
+    let original = hits
+        .iter()
+        .find(|h| h.path.as_deref() == Some("migrations/001.sql"))
+        .unwrap();
+    assert_eq!(original.later_changes, [long]);
+    assert!(
+        hits.iter()
+            .position(|h| h.text.contains("'archived'"))
+            .unwrap()
+            < hits
+                .iter()
+                .position(|h| h.path.as_deref() == Some("migrations/001.sql"))
+                .unwrap()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn newest_compares_normal_and_overflow_paths_and_last_chunk_in_a_file(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let (tenant, _) =
+        create_tenant_key(&test_router(state.clone()), "mixed-paths", &["read"]).await;
+    sql(&state, tenant, "app", "a.sql", CREATE).await;
+    let overflow = format!("m{}.sql", random_ascii(2049));
+    sql(&state, tenant, "app", &overflow, ALTER).await;
+    sql(&state, tenant, "app", "z.sql", "ALTER TABLE accounts ADD COLUMN x int;\nCREATE TABLE unrelated (id int);\nDROP TABLE accounts;").await;
+    let hits = find(&state, tenant, "account statuses", 5).await;
+    assert!(hits[0].text.contains("DROP TABLE accounts"), "{hits:?}");
+    let original = hits
+        .iter()
+        .find(|h| h.path.as_deref() == Some("a.sql"))
+        .unwrap();
+    assert_eq!(original.later_changes, ["z.sql"]);
+    let mut ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), hits.len());
+    sqlx::query("DELETE FROM documents WHERE tenant_id = $1 AND external_id = 'z.sql'")
+        .bind(tenant)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let hits = find(&state, tenant, "account statuses", 5).await;
+    let original = hits
+        .iter()
+        .find(|h| h.path.as_deref() == Some("a.sql"))
+        .unwrap();
+    assert_eq!(original.later_changes, [overflow]);
+    assert!(hits[0].text.contains("'archived'"));
 }

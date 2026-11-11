@@ -300,14 +300,30 @@ async fn sql_changes(
          JOIN documents original ON original.id = base.document_id
          JOIN sql_subject_lookup original_subject ON original_subject.chunk_id = base.id
          CROSS JOIN LATERAL (
-             SELECT entry.chunk_id AS id, entry.path
-             FROM sql_subject_lookup entry
-             WHERE entry.tenant_id = $2
-               AND entry.source_id = original.source_id AND entry.kind = original.kind
-               AND entry.identity = original_subject.identity
-               AND entry.path >
-                   (original.metadata->>'path') COLLATE \"C\"
-             ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+             SELECT candidate.id, candidate.path FROM (
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord
+                  FROM sql_subject_lookup entry
+                  WHERE entry.tenant_id = $2
+                    AND entry.source_id = original.source_id AND entry.kind = original.kind
+                    AND entry.identity_hash = original_subject.identity_hash
+                    AND entry.identity = original_subject.identity
+                    AND octet_length(entry.path) <= 2048
+                    AND entry.path > (original.metadata->>'path') COLLATE \"C\"
+                  ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+                  LIMIT 1)
+                 UNION ALL
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord
+                  FROM sql_subject_lookup entry
+                  WHERE entry.tenant_id = $2
+                    AND entry.source_id = original.source_id AND entry.kind = original.kind
+                    AND entry.identity_hash = original_subject.identity_hash
+                    AND entry.identity = original_subject.identity
+                    AND octet_length(entry.path) > 2048
+                    AND entry.path > (original.metadata->>'path') COLLATE \"C\"
+                  ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+                  LIMIT 1)
+             ) candidate
+             ORDER BY candidate.path DESC, candidate.ord DESC, candidate.id DESC
              LIMIT 1
          ) latest
          WHERE base.id = ANY($1) AND base.tenant_id = $2

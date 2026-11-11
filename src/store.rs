@@ -404,6 +404,12 @@ async fn insert_chunk(
     ord: usize,
     c: &IndexedChunk,
 ) -> sqlx::Result<()> {
+    let identity_hashes: Vec<Vec<u8>> = c
+        .chunk
+        .sql_identities
+        .iter()
+        .map(|identity| Sha256::digest(identity.as_bytes()).to_vec())
+        .collect();
     sqlx::query(
         "WITH added AS (INSERT INTO chunks
            (tenant_id, document_id, ord, text, start_line, end_line, symbols, tsv, embedding,
@@ -413,13 +419,12 @@ async fn insert_chunk(
                    || setweight(to_tsvector('english', $9::text), 'B'),
                  $10, $11, $12)
          RETURNING id)
-         INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, path, ord)
-         SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, d.metadata->>'path', $3
+         INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, identity_hash, path, ord)
+         SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, subjects.identity_hash, d.metadata->>'path', $3
          FROM added
          JOIN documents d ON d.id = $2
-         CROSS JOIN unnest($12::text[], $13::text[]) AS subjects(subject, identity)
-         WHERE d.metadata->>'path' IS NOT NULL
-           AND octet_length(d.metadata->>'path') <= 2048",
+         CROSS JOIN unnest($12::text[], $13::text[], $14::bytea[]) AS subjects(subject, identity, identity_hash)
+         WHERE d.metadata->>'path' IS NOT NULL",
     )
     .bind(tenant_id)
     .bind(document_id)
@@ -434,6 +439,7 @@ async fn insert_chunk(
     .bind(c.chunk.enumerates)
     .bind(&c.chunk.sql_subjects)
     .bind(&c.chunk.sql_identities)
+    .bind(&identity_hashes)
     .execute(conn)
     .await?;
     Ok(())
