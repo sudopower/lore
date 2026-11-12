@@ -7,7 +7,9 @@ use sqlx::postgres::PgPoolOptions;
 const CONNECT_ATTEMPTS: u32 = 30;
 const CONNECT_DELAY: Duration = Duration::from_secs(2);
 
-/// Connects to Postgres with at most 10 connections. Retries 30 times, 2s apart (each
+/// Connects with two ready Postgres connections and a maximum of 10. The spare lets the
+/// first authentication share startup with the immediate session poll without opening a backend.
+/// Retries 30 times, 2s apart (each
 /// attempt waits up to 3s for a connection),
 /// so a process that starts before the database is ready does not crash-loop.
 pub async fn connect(url: &str) -> Result<PgPool> {
@@ -15,6 +17,7 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     loop {
         match PgPoolOptions::new()
             .max_connections(10)
+            .min_connections(2)
             .acquire_timeout(Duration::from_secs(3))
             .connect(url)
             .await

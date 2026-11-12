@@ -2,9 +2,11 @@
 
 The fourth RRF list changes ranking, not the search response shape. It activates on explicit symbol names or call/definition/connection intent, rather than incidental English words. For example, both `what calls index_text?` and `how does checkout reach persist?` activate it. An ordinary question about a time budget does not.
 
+The integrated comparison against main's #50 executable repeats the same public 20-question ranks and the same four supplemental ranks shown below, using real BGE embeddings and the gold commit. There are no public-set per-question regressions; the supplemental 27-to-34 regression remains visible rather than being excluded.
+
 ## Ranking
 
-Local search-only evaluation uses `fastembed:bge-small-en-v1.5`, the default embedding model, and no language model. Both servers index the same 117 files and 1,773 chunks from commit `105500e75cdf3d65886d5220ca070440735b50bb`. The baseline executable is built from that commit. Matched comparisons also use identical stored vectors and chunk ids in isolated databases. Build baseline and candidate in separate Cargo target directories, or verify copied executables, to avoid stale shared-target artifacts.
+The original standalone search-only evaluation uses `fastembed:bge-small-en-v1.5`, the default embedding model, and no language model. Both servers index the same 117 files and 1,773 chunks from commit `105500e75cdf3d65886d5220ca070440735b50bb`. The baseline executable is built from that commit. Matched comparisons also use identical stored vectors and chunk ids in isolated databases. Build baseline and candidate in separate Cargo target directories, or verify copied executables, to avoid stale shared-target artifacts.
 
 The public 20-question set from #32 has **no per-question rank changes**:
 
@@ -50,11 +52,48 @@ DATABASE_URL=postgres://lore:lore@localhost:5434/lore_i37 \
 
 It starts a fresh process and database, stores 20,092 chunks, and measures 40 calls including the first call, misses, two-name queries, eight symbols with five definitions each, and a 25-definition expansion with 50 caller candidates and 64 selected callee names. It alternates unfiltered and source-filtered lookups. The heavy rows hold 256 metadata entries of up to 128 bytes. Definitions fill the output before expansion when the 30-result budget is already full. The full suite separately checks 100-definition and 200-caller truncation, and retrieval through a one-connection pool.
 
-On the delivered implementation, the first call took **4.825 ms** and the worst of 40 took **32.093 ms**, below the issue's **50 ms** added-latency ceiling. These are added-branch wall times, not full search times. No latency limit was loosened.
+On the integrated implementation, the first call took **7.672 ms** and the worst of 40 took **20.475 ms**, below the issue's **50 ms** added-latency ceiling. These are added-branch wall times, not full search times. No latency limit was loosened.
+
+The first integration run failed at **92.904 ms**. `EXPLAIN (ANALYZE, BUFFERS)` on its retained 20,092-chunk fixture showed source-filtered custom plans scanning every chunk in the source before intersecting matched ids: even a one-definition `persist` lookup took 71.985 ms. Hydrating each matched id through a correlated `LATERAL` query with `OFFSET 0` keeps both custom and generic plans on primary-key lookups; that scoped query then took 0.051 ms. Stored metadata, source/kind filters, stable ordering and lookup caps remain unchanged. A regression with 242 excluded source/kind rows checks filtering precedes the caps.
+
+Related retrieval projects only metadata it uses, after the same scoped sort and row cap. Definitions keep relevant bare and qualified names; callers keep all variants of the matched calls. The global first 64 distinct callee names are selected on the server in the original definition/call order. Only useful callee results trigger a final source-call lookup, which includes every co-defined name, not just those 64. Public symbol lookups still return their complete metadata. Differential tests retain the original algorithm as an oracle and independently check qualifiers, ambiguity, scope, caps and co-defined names beyond the global budget.
+
+The first projection implementation failed the branch gate at **56.275 ms** because it reversed every long, unqualified metadata entry twice. A bare-name fast path removes those allocations while preserving the original rightmost-delimiter rule for qualified names, including overlapping colons and Unicode. That optimization did not change vector retrieval, embeddings, accuracy limits or lookup caps.
 
 The new GIN indexes use `fastupdate=off`. A default pending list made a negative 64-name lookup scan recent bulk inserts and miss the 50 ms gate. Direct index updates shift that work to ingestion instead; lookup limits and accuracy were not relaxed. This gate measures the added branch, not embedding/model startup, network latency or a production-sized corpus.
 
-Full cold HTTP searches also exercise the default local embedding model, `k=50` and `source=lore`. Each baseline/candidate pair starts fresh servers on cloned data with identical stored vectors and ids; their first search is timed after the server finishes loading the model, without query warm-up. Each query runs in both server orders. The real 1,773-chunk corpus covers `index_text` and eight real symbol names. A 21,863-chunk copy adds 20,000 distractors, 40 five-per-name definitions with maximum-sized metadata arrays, and 50 caller candidates as in the branch gate.
+### Exact source-filtered vector ranking
+
+The graph-only integrated implementation still failed the full HTTP gate at **163.784 ms** added latency, including a **50.826 ms** increase for an absent symbol with no graph matches. Source-filtered vector retrieval now preselects matching document ids once and uses an exact cosine-distance sort, with chunk-id tie breaking and the same 50-candidate cap. Source-null SQL remains byte-for-byte identical to the prior implementation, including its approximate HNSW path and kind-only behavior. All branches still use the same repeatable-read connection.
+
+This deliberately changes approximate filtered results when HNSW misses nearer chunks. An independent exhaustive scalar cosine reference checked the actual shipping query on 42,166 chunks, including 1,000 other-tenant repos, two real BGE vectors, both custom and generic plans, broad/selective sources, kind filters, other/unknown tenants, absent scopes and large identical-vector ties. All 32 ordered-id/enumeration comparisons match; cosine distances differ from double-precision `math.fsum` by at most **0.000000167**. In the second-vector broad/code cases the original approximate path returned background copies at distance 0.340762 while exact ranking correctly finds the query vector's own chunk at distance zero.
+
+The control matrix also records tradeoffs, not a universal speedup: a custom broad-source plan took 5.022 ms with HNSW versus 19.150 ms exact; a selective three-row custom lookup took 0.085 versus 0.567 ms. A generic selective lookup dropped from 22.346 to 0.933 ms by avoiding 22,166 chunk/source probes, while a 20-row other-tenant generic query rose from 0.224 to 1.761 ms because the exact document/tenant bitmap intersection visits more index entries. These are diagnostic warm-plan times, not cold HTTP acceptance results.
+
+The integrated first-HTTP comparison after this change passes the light fixture at **16.999 ms** maximum added latency but still **fails** the heavy fixture at **55.689 ms** against the strict **50 ms** limit. All 16 pairs in both server orders, 32 fresh processes, remain recorded. The failing pair is reverse-order `checkout`; the other heavy increases are at most 45.547 ms. This is improvement over the earlier 163.784 ms failure, not a passing acceptance result. Follow-up phase diagnostics found first-auth connection-acquisition contention in the unchanged startup/pool code on either executable, not a proven feature-specific regression.
+
+The production pool now eagerly establishes two connections, still capped at ten, before workers start. A controlled diagnostic showed authentication waiting 49.529 ms to open a second backend even though the initial poll returned the first backend after about 6 ms. A ready spare avoids that race without delaying the worker or moving the readiness message. It costs one extra idle Postgres backend, including for the migration CLI's shared constructor. The startup regression checks two live backends independently through `pg_stat_activity`, holds the first poll's connection across real authentication, and verifies that no third backend opens; arbitrary one-connection caller pools remain unchanged. Full first-HTTP comparisons also record startup and startup-plus-first-request times, rather than hiding the extra connection's startup cost outside the request timer.
+
+### Final integrated first-HTTP comparison
+
+After the ready-spare fix, the required gate passes against the current #50 baseline on genuine, byte-paired #50/#51 schemas. The light fixture's maximum added HTTP latency is **20.067 ms**; the heavy fixture's is **42.274 ms**, both strictly below **50 ms**. The same 16 paired searches, 32 fresh server processes, first request without query warm-up, `source=lore`, `k=50`, both server orders and every observation are retained.
+
+| Query shape | Largest candidate minus current #50 HTTP time (ms) |
+| --- | ---: |
+| Real `index_text` lookup | -62.926 |
+| Eight real symbols | 20.067 |
+| Heavy `checkout` | -16.921 |
+| Heavy `persist` | -57.764 |
+| Absent symbol | -20.454 |
+| Two background names | 42.274 |
+| Five heavy symbols | -35.832 |
+| Eight heavy symbols | -39.302 |
+
+Startup is not free and is reported separately, from process launch through readiness. Light-fixture startup deltas range from **-35.738 to +2,125.615 ms**; the first `index_text` candidate starts in 2,901.392 ms versus 775.777 ms baseline, and startup-plus-first-request increases by **2,062.478 ms**. This outlier is included, not discarded. Heavy-fixture startup deltas range from **-6.089 to +179.632 ms**, with maximum combined increase **137.170 ms**. These local startup/model/filesystem measurements vary substantially and do not isolate the extra backend's connection cost. The request gate passes, but this is **not** a claim of improved startup or universally faster end-to-end searches. All paired startup and combined observations were recorded in addition to, not instead of, the unchanged request timer.
+
+### Original standalone HTTP and ingestion measurements
+
+The following HTTP and ingestion measurements compare the original standalone implementation against `105500e`, not the integrated main baseline. Full cold HTTP searches exercise the default local embedding model, `k=50` and `source=lore`. Each baseline/candidate pair starts fresh servers on cloned data with identical stored vectors and ids; their first search is timed after the server finishes loading the model, without query warm-up. Each query runs in both server orders. The real 1,773-chunk corpus covers `index_text` and eight real symbol names. A 21,863-chunk copy adds 20,000 distractors, 40 five-per-name definitions with maximum-sized metadata arrays, and 50 caller candidates as in the branch gate.
 
 | Query shape | Largest candidate minus baseline (ms) |
 | --- | ---: |

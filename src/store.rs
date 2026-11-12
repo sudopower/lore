@@ -5,16 +5,18 @@
 //! Vocabulary: a "source kind" is `sources.kind` (`repo`, `traces`, `documents`); a "document kind"
 //! is `documents.kind` (`code`, `doc`, `session`, `note`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use pgvector::Vector;
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sha2::{Digest, Sha256};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::chunk::{Chunk, embed_text, lexical_text};
+use crate::config::EmbeddingCache;
 use crate::embed::{DIM, embed_documents_async};
 use crate::error::AppError;
 use crate::http::AppState;
@@ -242,6 +244,11 @@ async fn load_document(
     tenant_id: Uuid,
     document_id: Uuid,
 ) -> sqlx::Result<Option<(DocumentRow, String)>> {
+    // Metadata and chunks must describe the same document version across a repo publication.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let found: Option<StoredDocument> = sqlx::query_as(
         "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri, d.metadata,
                 d.metadata->>'path' AS path, d.body
@@ -251,12 +258,14 @@ async fn load_document(
     )
     .bind(document_id)
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(StoredDocument { row, body }) = found else {
+        tx.commit().await?;
         return Ok(None);
     };
     if let Some(body) = body {
+        tx.commit().await?;
         return Ok(Some((row, body)));
     }
     let chunks: Vec<(String, i32, i32)> = sqlx::query_as(
@@ -265,8 +274,9 @@ async fn load_document(
     )
     .bind(document_id)
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Some((row, join_chunks(&chunks))))
 }
 
@@ -298,11 +308,15 @@ fn join_chunks(chunks: &[(String, i32, i32)]) -> String {
 
 /// Records the commit a repo source has been indexed up to. `source_id` comes from a `Source` the
 /// caller already fetched for its tenant.
-pub async fn set_indexed_commit(pool: &PgPool, source_id: Uuid, sha: &str) -> sqlx::Result<()> {
+pub async fn set_indexed_commit<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    source_id: Uuid,
+    sha: &str,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE sources SET indexed_commit = $2, updated_at = now() WHERE id = $1")
         .bind(source_id)
         .bind(sha)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
@@ -344,8 +358,8 @@ pub async fn upsert_document(
 }
 
 /// The stored content hash of a document, for skipping files that did not change.
-pub async fn document_hash(
-    pool: &PgPool,
+pub async fn document_hash<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
     source_id: Uuid,
     external_id: &str,
 ) -> sqlx::Result<Option<String>> {
@@ -354,15 +368,18 @@ pub async fn document_hash(
     )
     .bind(source_id)
     .bind(external_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// The external ids of every document of a source.
-pub async fn list_external_ids(pool: &PgPool, source_id: Uuid) -> sqlx::Result<Vec<String>> {
+pub async fn list_external_ids<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    source_id: Uuid,
+) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar("SELECT external_id FROM documents WHERE source_id = $1")
         .bind(source_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
 }
 
@@ -443,6 +460,123 @@ pub async fn delete_document(
     Ok(res.rows_affected() > 0)
 }
 
+/// Who shares a cache entry: everyone (`Some(None)`), one tenant (`Some(Some(id))`), or nobody
+/// because the cache is off (`None`).
+fn cache_scope(mode: EmbeddingCache, tenant_id: Uuid) -> Option<Option<Uuid>> {
+    match mode {
+        EmbeddingCache::Shared => Some(None),
+        EmbeddingCache::Tenant => Some(Some(tenant_id)),
+        EmbeddingCache::Off => None,
+    }
+}
+
+/// The `embedding_cache` key of `text` embedded by the embedder named `model`: sha256 of the
+/// model name and the exact text, so a different embedder never finds another's vectors. With a
+/// tenant (`LORE_EMBEDDING_CACHE=tenant`) the tenant id goes in too, and the leading byte keeps
+/// the two kinds of key apart.
+pub fn embedding_cache_key(tenant: Option<Uuid>, model: &str, text: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    match tenant {
+        None => h.update([0u8]),
+        Some(t) => {
+            h.update([1u8]);
+            h.update(t.as_bytes());
+        }
+    }
+    h.update(model.as_bytes());
+    h.update([0u8]);
+    h.update(text.as_bytes());
+    h.finalize().into()
+}
+
+/// The cached vectors of those `keys` that have one, by key.
+async fn cached_embeddings<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    keys: &[[u8; 32]],
+) -> sqlx::Result<HashMap<Vec<u8>, Vec<f32>>> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let rows: Vec<(Vec<u8>, Vector)> =
+        sqlx::query_as("SELECT key, embedding FROM embedding_cache WHERE key = ANY($1)")
+            .bind(&keys)
+            .fetch_all(executor)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(k, v)| (k, v.to_vec()))
+        .filter(|(_, v)| v.len() == DIM)
+        .collect())
+}
+
+/// Rows per `INSERT` into `embedding_cache` (2 binds each).
+const CACHE_INSERT_CHUNK: usize = 1000;
+
+/// Adds vectors to the cache. A key that is already there keeps its row: the same embedder gave
+/// the same text the same vector.
+async fn put_cached_embeddings(pool: &PgPool, entries: &[(&[u8], &Vec<f32>)]) -> sqlx::Result<()> {
+    for chunk in entries.chunks(CACHE_INSERT_CHUNK) {
+        let mut q =
+            sqlx::QueryBuilder::<Postgres>::new("INSERT INTO embedding_cache (key, embedding) ");
+        q.push_values(chunk, |mut b, (key, v)| {
+            b.push_bind(*key).push_bind(Vector::from((*v).clone()));
+        });
+        q.push(" ON CONFLICT (key) DO NOTHING");
+        q.build().execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Fresh exact-key vectors awaiting publication, never written while a repo transaction holds
+/// document/source locks. Dropping this on rollback simply leaves cold cache entries.
+#[derive(Default)]
+pub(crate) struct PendingEmbeddings {
+    entries: Vec<([u8; 32], Vec<f32>)>,
+}
+
+impl PendingEmbeddings {
+    /// Publish only after the document transaction has committed and released its connection.
+    /// A cache error must not report an already-published index as a failed push.
+    pub(crate) async fn publish(self, pool: &PgPool) {
+        let retained_bytes = self.entries.capacity() * std::mem::size_of::<([u8; 32], Vec<f32>)>()
+            + self
+                .entries
+                .iter()
+                .map(|(_, v)| v.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>();
+        tracing::debug!(
+            entries = self.entries.len(),
+            retained_bytes,
+            "publishing staged embeddings"
+        );
+        let mut entries: Vec<(&[u8], &Vec<f32>)> = self
+            .entries
+            .iter()
+            .map(|(key, vector)| (key.as_slice(), vector))
+            .collect();
+        // Every INSERT is an independent short statement, with one global lock order.
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        if let Err(error) = put_cached_embeddings(pool, &entries).await {
+            tracing::warn!(%error, "embedding cache publication failed; index is already committed");
+        }
+    }
+}
+
+fn cache_keys(
+    state: &AppState,
+    tenant_id: Uuid,
+    title: &str,
+    chunks: &[Chunk],
+) -> Option<Vec<[u8; 32]>> {
+    cache_scope(state.config.embedding_cache, tenant_id).map(|scope| {
+        chunks
+            .iter()
+            .map(|c| embedding_cache_key(scope, state.embedder.name(), &embed_text(title, c)))
+            .collect()
+    })
+}
+
 /// The key under which a stored embedding is found again: the part of `embed_text` that comes
 /// after the title (the symbols, then the text).
 fn embedding_key(text: &str, symbols: &[String]) -> String {
@@ -454,8 +588,8 @@ fn embedding_key(text: &str, symbols: &[String]) -> String {
 /// because then the stored vectors were made from another `embed_text`. All callers of
 /// `index_text` store the title they embed with, so a stored title that differs means the title
 /// changed and every chunk has to be embedded again.
-async fn stored_embeddings(
-    pool: &PgPool,
+async fn stored_embeddings<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
     tenant_id: Uuid,
     source_id: Uuid,
     external_id: &str,
@@ -471,7 +605,7 @@ async fn stored_embeddings(
     .bind(source_id)
     .bind(external_id)
     .bind(title_for_embed)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
@@ -482,12 +616,12 @@ async fn stored_embeddings(
 /// The shared indexing path (repos, sessions, documents): embeds the chunks, then stores the
 /// document and its chunks in one short transaction. Returns the chunk count.
 ///
-/// A chunk whose text and symbols equal those of a chunk the document already has (and whose
-/// title is unchanged) keeps the stored embedding, so only new or changed chunks reach the
-/// embedder. This is what keeps a growing session cheap to index again.
+/// Exact model/text cache hits and unchanged chunks from this document keep their vectors.
+/// A moved file is embedded again, because its path is part of `embed_text`.
 ///
-/// The embedding runs before the transaction opens, so no connection is held while the model
-/// works. `title_for_embed` is the path or title passed to `embed_text`.
+/// Standalone indexing embeds before opening its write transaction. Repo pushes instead use
+/// `index_repo_text` and retain one connection until all documents and the commit pointer publish.
+/// `title_for_embed` is the path or title passed to `embed_text`.
 pub async fn index_text(
     state: &AppState,
     tenant_id: Uuid,
@@ -506,7 +640,8 @@ pub async fn index_text(
 pub struct IndexStats {
     /// Chunks stored.
     pub chunks: usize,
-    /// Chunks the embedder computed a vector for. The others kept their stored vector.
+    /// Vectors the embedder computed. Other chunks reuse cached/stored vectors or repeat
+    /// an exact embed text already embedded in this call.
     pub embedded: usize,
     /// Wall-clock time spent embedding, including any wait for the embedder while other pushes
     /// use it.
@@ -525,7 +660,8 @@ pub async fn index_text_with_stats(
     if source.tenant_id != tenant_id || doc.tenant_id != tenant_id || doc.source_id != source.id {
         bail!("document does not belong to the source and tenant");
     }
-    let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
+    let keys = cache_keys(state, tenant_id, title_for_embed, &chunks);
+    let cached = cached_embeddings(&state.pool, keys.as_deref().unwrap_or_default()).await?;
     let stored = stored_embeddings(
         &state.pool,
         tenant_id,
@@ -534,37 +670,114 @@ pub async fn index_text_with_stats(
         title_for_embed,
     )
     .await?;
-    let mut embeddings: Vec<Option<Vec<f32>>> = chunks
+    let (indexed, stats, pending) =
+        prepare_chunks(state, chunks, title_for_embed, stored, keys, cached).await?;
+    let mut tx = state.pool.begin().await?;
+    let document_id = upsert_document(&mut tx, &doc).await?;
+    replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
+    tx.commit().await?;
+    pending.publish(&state.pool).await;
+    Ok(stats)
+}
+
+/// Repo pushes keep every changed document in the same transaction. Cache and document reads
+/// use that connection; fresh vectors are staged until the entire push commits.
+pub(crate) async fn index_repo_text(
+    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
+    pending: &mut PendingEmbeddings,
+    doc: NewDocument,
+    chunks: Vec<Chunk>,
+) -> Result<IndexStats> {
+    let keys = cache_keys(state, doc.tenant_id, &doc.title, &chunks);
+    let cached = cached_embeddings(&mut **tx, keys.as_deref().unwrap_or_default()).await?;
+    let stored = stored_embeddings(
+        &mut **tx,
+        doc.tenant_id,
+        doc.source_id,
+        &doc.external_id,
+        &doc.title,
+    )
+    .await?;
+    let (indexed, stats, fresh) =
+        prepare_chunks(state, chunks, &doc.title, stored, keys, cached).await?;
+    let id = upsert_document(tx, &doc).await?;
+    replace_chunks(tx, doc.tenant_id, id, &indexed).await?;
+    pending.entries.extend(fresh.entries);
+    Ok(stats)
+}
+
+async fn prepare_chunks(
+    state: &AppState,
+    chunks: Vec<Chunk>,
+    title_for_embed: &str,
+    stored: HashMap<String, Vec<f32>>,
+    keys: Option<Vec<[u8; 32]>>,
+    cached: HashMap<Vec<u8>, Vec<f32>>,
+) -> Result<(Vec<IndexedChunk>, IndexStats, PendingEmbeddings)> {
+    let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
+    let texts: Vec<String> = chunks
         .iter()
-        .map(|c| {
-            stored
-                .get(&embedding_key(&c.text, &c.symbols))
-                .filter(|v| v.len() == DIM)
-                .cloned()
-        })
+        .map(|c| embed_text(title_for_embed, c))
         .collect();
-    let missing: Vec<usize> = (0..chunks.len())
-        .filter(|i| embeddings[*i].is_none())
+    let mut pending = PendingEmbeddings::default();
+    let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+    if let Some(keys) = &keys {
+        for (i, key) in keys.iter().enumerate() {
+            embeddings[i] = cached.get(key.as_slice()).cloned();
+        }
+    }
+    if embeddings.iter().any(Option::is_none) {
+        for (i, c) in chunks.iter().enumerate() {
+            if embeddings[i].is_none() {
+                embeddings[i] = stored
+                    .get(&embedding_key(&c.text, &c.symbols))
+                    .filter(|v| v.len() == DIM)
+                    .cloned();
+            }
+        }
+    }
+
+    // Chunks with the same embed text (repeated blocks in one file) are embedded once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let unique: Vec<usize> = (0..chunks.len())
+        .filter(|i| embeddings[*i].is_none() && seen.insert(texts[*i].as_str()))
         .collect();
-    let embedded = missing.len();
+    let embedded = unique.len();
     let mut embed_time = Duration::ZERO;
-    if !missing.is_empty() {
-        let texts: Vec<String> = missing
-            .iter()
-            .map(|i| embed_text(title_for_embed, &chunks[*i]))
-            .collect();
+    if !unique.is_empty() {
+        let batch: Vec<String> = unique.iter().map(|i| texts[*i].clone()).collect();
         let started = Instant::now();
-        let fresh = embed_documents_async(state.embedder.clone(), texts).await?;
+        let fresh = embed_documents_async(state.embedder.clone(), batch).await?;
         embed_time = started.elapsed();
-        if fresh.len() != missing.len() {
+        if fresh.len() != unique.len() {
             bail!(
                 "embedder returned {} vectors for {} chunks",
                 fresh.len(),
-                missing.len()
+                unique.len()
             );
         }
-        for (i, v) in missing.into_iter().zip(fresh) {
-            embeddings[i] = Some(v);
+        // Only vectors the embedder just computed go into the cache: a stored chunk vector may
+        // predate an embedder change, and the cache must never hand one tenant a vector that
+        // did not come from the embedder.
+        if let Some(keys) = &keys {
+            pending.entries.extend(
+                unique
+                    .iter()
+                    .zip(&fresh)
+                    .filter(|(_, vector)| vector.len() == DIM)
+                    .map(|(i, vector)| (keys[*i], vector.clone())),
+            );
+        }
+        let fresh_of: HashMap<&str, Vec<f32>> = unique
+            .iter()
+            .map(|i| texts[*i].as_str())
+            .zip(fresh)
+            .collect();
+        for (i, slot) in embeddings.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = fresh_of.get(texts[i].as_str()).cloned();
+            }
         }
     }
     let embeddings: Vec<Vec<f32>> = embeddings.into_iter().flatten().collect();
@@ -586,15 +799,12 @@ pub async fn index_text_with_stats(
         })
         .collect();
 
-    let mut tx = state.pool.begin().await?;
-    let document_id = upsert_document(&mut tx, &doc).await?;
-    replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
-    tx.commit().await?;
-    Ok(IndexStats {
+    let stats = IndexStats {
         chunks: indexed.len(),
         embedded,
         embed_time,
-    })
+    };
+    Ok((indexed, stats, pending))
 }
 
 /// Rows per `INSERT` of spans: 14 binds each stays well under Postgres's 65535 limit.

@@ -215,13 +215,17 @@ pub async fn search(
         kinds: kinds.as_deref(),
         source: query.source.as_deref(),
     };
-    // Embed without holding a connection. Pin one for every lookup after that: handing
-    // connections back between branches can open an extra cold Postgres connection.
+    // Embed before acquiring the one connection shared by every ranking branch.
     let embedding = embed_query_async(embedder, q.to_string()).await?;
-    let mut connection = pool.acquire().await?;
-    let lexical = lexical_branch(&mut connection, q, &filter).await?;
-    let vector_hits = vector_branch(&mut connection, embedding, &filter).await?;
-    let related = callgraph::related_on(&mut connection, &scope, q).await?;
+    // A push can commit between any two queries, including ranking and hydration. One MVCC
+    // snapshot keeps every branch on the same version, even when its old chunks are deleted.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let lexical = lexical_branch(&mut tx, q, &filter).await?;
+    let vector_hits = vector_branch(&mut tx, embedding, &filter).await?;
+    let related = callgraph::related_on(&mut tx, &scope, q).await?;
     let vector: Vec<i64> = vector_hits.iter().map(|(id, _)| *id).collect();
     // The enumerations the vector branch found, in its order: an enumeration far from the query
     // in meaning is not lifted, however few enumerations there are.
@@ -235,12 +239,13 @@ pub async fn search(
     let mut fused = fuse(&[&lexical, &vector, &enumerations, &related]);
     fused.truncate(k);
     if fused.is_empty() {
+        tx.commit().await?;
         return Ok(Vec::new());
     }
 
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
-    let mut by_id = hits_by_id(&mut *connection, query.tenant_id, &ids).await?;
-    // A chunk deleted since the branches ran is simply missing.
+    let mut by_id = hits_by_id(&mut *tx, query.tenant_id, &ids).await?;
+    tx.commit().await?;
     Ok(fused
         .into_iter()
         .filter_map(|(id, score)| by_id.remove(&id).map(|hit| Hit { score, ..hit }))
@@ -323,14 +328,25 @@ async fn vector_branch(
 ) -> Result<Vec<(i64, bool)>, AppError> {
     // The filters are applied after the index scan, so let it keep scanning until it has enough
     // rows that pass them.
-    let mut tx = sqlx::Connection::begin(connection).await?;
     sqlx::query("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
     sqlx::query("SET LOCAL hnsw.ef_search = 100")
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
-    let hits = sqlx::query_as(
+    // Exact source-scoped ranking avoids repeated document joins. Adding zero keeps the
+    // distance sort off HNSW, including its approximate candidate set and tie ordering.
+    // Source-null searches retain the existing approximate index path below.
+    let query = if f.source.is_some() {
+        "SELECT c.id, c.enumerates
+         FROM chunks c
+         WHERE c.tenant_id = $1
+           AND c.document_id = ANY(ARRAY(
+               SELECT d.id FROM documents d JOIN sources s ON s.id = d.source_id
+               WHERE ($2::text[] IS NULL OR d.kind = ANY($2)) AND s.name = $3))
+         ORDER BY (c.embedding <=> $4) + 0, c.id
+         LIMIT $5"
+    } else {
         "SELECT c.id, c.enumerates
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
@@ -338,16 +354,16 @@ async fn vector_branch(
          WHERE c.tenant_id = $1
            AND ($2::text[] IS NULL OR d.kind = ANY($2)) AND ($3::text IS NULL OR s.name = $3)
          ORDER BY c.embedding <=> $4, c.id
-         LIMIT $5",
-    )
-    .bind(f.tenant_id)
-    .bind(f.kinds)
-    .bind(f.source)
-    .bind(Vector::from(embedding))
-    .bind(BRANCH_LIMIT)
-    .fetch_all(&mut *tx)
-    .await?;
-    tx.commit().await?;
+         LIMIT $5"
+    };
+    let hits = sqlx::query_as(query)
+        .bind(f.tenant_id)
+        .bind(f.kinds)
+        .bind(f.source)
+        .bind(Vector::from(embedding))
+        .bind(BRANCH_LIMIT)
+        .fetch_all(connection)
+        .await?;
     Ok(hits)
 }
 
@@ -465,6 +481,9 @@ fn push_encoded_path(out: &mut String, path: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod exact_vector_tests;
 
 #[cfg(test)]
 mod tests {

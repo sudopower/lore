@@ -213,6 +213,69 @@ async fn scopes_ambiguity_replacement_and_deletion_are_respected(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn source_and_kind_filters_apply_before_definition_caps(pool: PgPool) {
+    let (state, tenant) = setup(pool).await;
+    for (source, path) in [
+        ("other", "src/a.rs"),
+        ("app", "src/b.rs"),
+        ("app", "src/z.rs"),
+    ] {
+        add(&state, tenant, source, path, "pub fn select_target() {}\n").await;
+    }
+    sqlx::query("UPDATE documents SET kind = 'doc' WHERE metadata->>'path' = 'src/b.rs'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    // Excluded rows sort before the one eligible definition and exceed both lookup caps.
+    sqlx::query(
+        "INSERT INTO chunks (tenant_id,document_id,ord,text,tsv,embedding,defines,calls)
+         SELECT c.tenant_id,c.document_id,n,c.text,c.tsv,c.embedding,c.defines,c.calls
+         FROM chunks c JOIN documents d ON d.id = c.document_id
+         CROSS JOIN generate_series(1,120) n
+         WHERE d.metadata->>'path' IN ('src/a.rs','src/b.rs')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let kinds = vec!["code".into()];
+    let scope = Scope {
+        tenant_id: tenant,
+        source: Some("app"),
+        kinds: Some(&kinds),
+    };
+    let symbol = parse_symbol("select_target").unwrap();
+    let result = callgraph::definition_lookup(&state.pool, &scope, &symbol)
+        .await
+        .unwrap();
+    assert!(!result.truncated);
+    assert_eq!(result.definitions.len(), 1);
+    assert_eq!(result.definitions[0].path.as_deref(), Some("src/z.rs"));
+    assert_eq!(
+        callgraph::related(&state.pool, &scope, "select_target")
+            .await
+            .unwrap(),
+        vec![result.definitions[0].chunk_id]
+    );
+    let unfiltered_kind = Scope {
+        kinds: None,
+        ..scope
+    };
+    assert!(
+        callgraph::definition_lookup(&state.pool, &unfiltered_kind, &symbol)
+            .await
+            .unwrap()
+            .truncated
+    );
+    assert!(
+        callgraph::related(&state.pool, &unfiltered_kind, "select_target")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a capped definition set must not infer uniqueness"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn capped_definition_sets_do_not_infer_unique_edges(pool: PgPool) {
     let (state, tenant) = setup(pool).await;
     add(

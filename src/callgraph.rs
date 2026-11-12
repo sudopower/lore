@@ -230,7 +230,9 @@ async fn sites_with(
     debug_assert!(matches!(column, "defines" | "calls"));
     // Probe GIN one name at a time before source joins. A wide overlap predicate can
     // otherwise make the planner scan every chunk in the source, even for absent names.
-    // Materialize ids only, not the potentially wide metadata arrays.
+    // Materialize ids only, not the potentially wide metadata arrays. Hydrate each id behind
+    // another planner fence: otherwise a source filter can reorder the outer joins into a
+    // scan of every chunk in that source before intersecting the matched ids.
     let sites = sqlx::query_as(&format!(
         "WITH matched AS MATERIALIZED (
              SELECT DISTINCT site.id
@@ -241,14 +243,20 @@ async fn sites_with(
                  OFFSET 0
              ) site
          )
-         SELECT {SITE_COLUMNS}
+         SELECT site.chunk_id, site.document_id, site.source_id, site.path,
+                site.defines, site.calls
          FROM matched m
-         JOIN chunks c ON c.id = m.id
-         JOIN documents d ON d.id = c.document_id
-         JOIN sources s ON s.id = d.source_id
-         WHERE c.tenant_id = $1
-           AND ($3::text[] IS NULL OR d.kind = ANY($3)) AND ($4::text IS NULL OR s.name = $4)
-         ORDER BY d.metadata->>'path', c.start_line, c.id
+         CROSS JOIN LATERAL (
+             SELECT {SITE_COLUMNS}, d.metadata->>'path' AS sort_path, c.start_line
+             FROM chunks c
+             JOIN documents d ON d.id = c.document_id
+             JOIN sources s ON s.id = d.source_id
+             WHERE c.id = m.id AND c.tenant_id = $1
+               AND ($3::text[] IS NULL OR d.kind = ANY($3))
+               AND ($4::text IS NULL OR s.name = $4)
+             OFFSET 0
+         ) site
+         ORDER BY site.sort_path, site.start_line, site.chunk_id
          LIMIT $5"
     ))
     .bind(scope.tenant_id)
@@ -259,6 +267,140 @@ async fn sites_with(
     .fetch_all(connection)
     .await?;
     Ok(sites)
+}
+
+enum RelatedProjection<'a> {
+    Definitions(&'a [String]),
+    Callers(&'a [String]),
+    Callees(&'a [i64]),
+}
+
+/// Related retrieval only: apply metadata projections after the same scoped, ordered row cap.
+/// Public symbol lookups keep their complete Site arrays through sites_with.
+async fn related_sites(
+    connection: &mut PgConnection,
+    scope: &Scope<'_>,
+    names: &[String],
+    projection: RelatedProjection<'_>,
+) -> Result<Vec<Site>, AppError> {
+    // Bare names dominate padded batches. Avoid allocating two reversed copies for them,
+    // but retain the rightmost-delimiter rule for qualified names and overlapping colons.
+    let (prefix, name_source, column, defines, calls) = match &projection {
+        RelatedProjection::Definitions(_) => (
+            String::new(),
+            "unnest($2::text[]) AS names(name)",
+            "defines",
+            "ARRAY(SELECT entry FROM unnest(b.defines) WITH ORDINALITY AS entries(entry, ord)
+                   WHERE (CASE WHEN strpos(entry, '::') = 0 THEN entry
+                         ELSE reverse(split_part(reverse(entry), '::', 1)) END) COLLATE \"C\" = ANY($6::text[])
+                   ORDER BY ord)",
+            "'{}'::text[]",
+        ),
+        RelatedProjection::Callers(_) => (
+            String::new(),
+            "unnest($2::text[]) AS names(name)",
+            "calls",
+            "'{}'::text[]",
+            "ARRAY(SELECT entry FROM unnest(b.calls) WITH ORDINALITY AS entries(entry, ord)
+                   WHERE (CASE WHEN strpos(entry, '::') = 0 THEN entry
+                         ELSE reverse(split_part(reverse(entry), '::', 1)) END) COLLATE \"C\" = ANY($6::text[])
+                   ORDER BY ord)",
+        ),
+        RelatedProjection::Callees(_) => (
+            format!(
+                "source_calls AS MATERIALIZED (
+                     SELECT wanted.def_ord, entries.call_ord,
+                            (CASE WHEN strpos(entries.entry, '::') = 0 THEN entries.entry
+                         ELSE reverse(split_part(reverse(entries.entry), '::', 1)) END) AS name
+                     FROM unnest($6::bigint[]) WITH ORDINALITY AS wanted(id, def_ord)
+                     CROSS JOIN LATERAL (
+                         SELECT calls FROM chunks
+                         WHERE id = wanted.id AND tenant_id = $1
+                         OFFSET 0
+                     ) c
+                     CROSS JOIN LATERAL unnest(c.calls) WITH ORDINALITY AS entries(entry, call_ord)
+                 ), first_names AS (
+                     SELECT DISTINCT ON (name COLLATE \"C\") name, def_ord, call_ord
+                     FROM source_calls
+                     WHERE NOT (name COLLATE \"C\" = ANY($2::text[]))
+                     ORDER BY name COLLATE \"C\", def_ord, call_ord
+                 ), callee_names AS MATERIALIZED (
+                     SELECT name FROM first_names ORDER BY def_ord, call_ord
+                     LIMIT {RELATED_CALLEE_NAMES}
+                 ), "
+            ),
+            "callee_names AS names",
+            "defines",
+            "b.defines",
+            "'{}'::text[]",
+        ),
+    };
+    let sql = format!(
+        "WITH {prefix}matched AS MATERIALIZED (
+             SELECT DISTINCT site.id
+             FROM {name_source}
+             CROSS JOIN LATERAL (
+                 SELECT id FROM chunks
+                 WHERE tenant_id = $1 AND {column} @> ARRAY[names.name]
+                 OFFSET 0
+             ) site
+         ), bounded AS MATERIALIZED (
+             SELECT site.*
+             FROM matched m
+             CROSS JOIN LATERAL (
+                 SELECT {SITE_COLUMNS}, d.metadata->>'path' AS sort_path, c.start_line
+                 FROM chunks c
+                 JOIN documents d ON d.id = c.document_id
+                 JOIN sources s ON s.id = d.source_id
+                 WHERE c.id = m.id AND c.tenant_id = $1
+                   AND ($3::text[] IS NULL OR d.kind = ANY($3))
+                   AND ($4::text IS NULL OR s.name = $4)
+                 OFFSET 0
+             ) site
+             ORDER BY site.sort_path, site.start_line, site.chunk_id
+             LIMIT $5
+         )
+         SELECT b.chunk_id, b.document_id, b.source_id, b.path,
+                {defines} AS defines, {calls} AS calls
+         FROM bounded b
+         ORDER BY b.sort_path, b.start_line, b.chunk_id"
+    );
+    let query = sqlx::query_as(&sql)
+        .bind(scope.tenant_id)
+        .bind(names)
+        .bind(scope.kinds)
+        .bind(scope.source)
+        .bind(RELATED_BRANCH);
+    let rows = match projection {
+        RelatedProjection::Definitions(names) | RelatedProjection::Callers(names) => {
+            query.bind(names).fetch_all(connection).await?
+        }
+        RelatedProjection::Callees(ids) => query.bind(ids).fetch_all(connection).await?,
+    };
+    Ok(rows)
+}
+
+/// Keep exactly source calls that can have candidates in the original final resolution loop.
+/// The names are all verbatim returned defines, not merely the 64 names used for lookup.
+async fn related_source_calls(
+    connection: &mut PgConnection,
+    tenant_id: Uuid,
+    ids: &[i64],
+    names: &[String],
+) -> Result<Vec<(i64, Vec<String>)>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT c.id,
+                ARRAY(SELECT entry FROM unnest(c.calls) WITH ORDINALITY AS entries(entry, ord)
+                      WHERE (CASE WHEN strpos(entry, '::') = 0 THEN entry
+                         ELSE reverse(split_part(reverse(entry), '::', 1)) END) COLLATE \"C\" = ANY($3::text[])
+                      ORDER BY ord)
+         FROM chunks c WHERE c.tenant_id = $1 AND c.id = ANY($2)",
+    )
+    .bind(tenant_id)
+    .bind(ids)
+    .bind(names)
+    .fetch_all(connection)
+    .await?)
 }
 
 /// What a call to `name` is stored as: the bare name, and `::name` for calls through a path.
@@ -490,7 +632,13 @@ pub(crate) async fn related_on(
     }
     let mut names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
     names.dedup();
-    let defs = sites_with(connection, scope, "defines", &names, RELATED_BRANCH).await?;
+    let mut defs = related_sites(
+        connection,
+        scope,
+        &names,
+        RelatedProjection::Definitions(&names),
+    )
+    .await?;
     if defs.len() == RELATED_BRANCH as usize {
         return Ok(Vec::new());
     }
@@ -527,28 +675,20 @@ pub(crate) async fn related_on(
         return Ok(out);
     }
 
+    let ordered_definition_ids = out.clone();
     let caller_keys: Vec<String> = matched
         .iter()
         .flat_map(|(name, _, _)| call_keys(name))
         .collect();
-    let matched_names: HashSet<&str> = matched.iter().map(|(n, _, _)| *n).collect();
-    let mut callee_names: Vec<String> = Vec::new();
-    let mut callee_seen = HashSet::new();
-    'names: for (_, _, meant) in &matched {
-        for def in defs.iter().filter(|d| meant.contains(&d.chunk_id)) {
-            for entry in &def.calls {
-                if callee_names.len() == RELATED_CALLEE_NAMES {
-                    break 'names;
-                }
-                let name = called_name(entry);
-                if !matched_names.contains(name) && callee_seen.insert(name) {
-                    callee_names.push(name.to_string());
-                }
-            }
-        }
-    }
+    let matched_names: Vec<String> = matched.iter().map(|(n, _, _)| n.to_string()).collect();
     // Reuse a pooled connection rather than opening another one on the first search.
-    let callers = sites_with(connection, scope, "calls", &caller_keys, RELATED_BRANCH).await?;
+    let callers = related_sites(
+        connection,
+        scope,
+        &caller_keys,
+        RelatedProjection::Callers(&matched_names),
+    )
+    .await?;
 
     for caller in &callers {
         for (name, all, meant) in &matched {
@@ -572,8 +712,32 @@ pub(crate) async fn related_on(
         out.truncate(RELATED_LIMIT);
         return Ok(out);
     }
-    let callees = sites_with(connection, scope, "defines", &callee_names, RELATED_BRANCH).await?;
+    let callees = related_sites(
+        connection,
+        scope,
+        &matched_names,
+        RelatedProjection::Callees(&ordered_definition_ids),
+    )
+    .await?;
     if !callees.is_empty() && callees.len() < RELATED_BRANCH as usize {
+        let mut needed: Vec<String> = callees
+            .iter()
+            .flat_map(|c| c.defines.iter().cloned())
+            .collect();
+        needed.sort_unstable();
+        needed.dedup();
+        for (id, calls) in related_source_calls(
+            connection,
+            scope.tenant_id,
+            &ordered_definition_ids,
+            &needed,
+        )
+        .await?
+        {
+            if let Some(def) = defs.iter_mut().find(|d| d.chunk_id == id) {
+                def.calls = calls;
+            }
+        }
         for (_, _, meant) in &matched {
             for def in defs.iter().filter(|d| meant.contains(&d.chunk_id)) {
                 for name in def.calls.iter().map(|e| called_name(e)) {
@@ -596,6 +760,9 @@ pub(crate) async fn related_on(
     out.truncate(RELATED_LIMIT);
     Ok(out)
 }
+
+#[cfg(test)]
+mod reference;
 
 #[cfg(test)]
 mod tests {

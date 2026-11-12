@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -28,11 +29,12 @@ use crate::chunk::{CHUNKER_VERSION, Language, chunk_file, language_for};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::store::{
-    IndexStats, NewDocument, Source, delete_document, document_hash, get_source,
-    index_text_with_stats, list_external_ids, set_indexed_commit,
+    IndexStats, NewDocument, PendingEmbeddings, Source, delete_document, document_hash, get_source,
+    index_repo_text, list_external_ids, set_indexed_commit,
 };
 
 pub mod progress;
+pub mod sync;
 
 use progress::PushHandle;
 
@@ -158,6 +160,11 @@ impl SourceLocks {
 /// configuration out (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`), turns prompts off, makes
 /// pathspecs literal and forces English messages (the caller matches on stderr).
 async fn git(args: &[&str]) -> Result<Vec<u8>, GitError> {
+    git_env(args, &[]).await
+}
+
+/// [`git`] with extra environment variables, set after the defaults.
+async fn git_env(args: &[&str], envs: &[(&str, &str)]) -> Result<Vec<u8>, GitError> {
     let fail = |status: String, stderr: String| GitError {
         args: args.join(" "),
         status,
@@ -177,6 +184,7 @@ async fn git(args: &[&str]) -> Result<Vec<u8>, GitError> {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
@@ -279,6 +287,21 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Removes the mirror and checkout of each source, `<data_dir>/repos/<source_id>`. A missing
+/// directory is fine; any other failure is logged and the next directory is still removed.
+pub async fn remove_repo_dirs(data_dir: &Path, source_ids: &[Uuid]) {
+    for id in source_ids {
+        let dir = data_dir.join("repos").join(id.to_string());
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => tracing::info!(source = %id, "repo directory removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(source = %id, dir = %dir.display(), error = %e, "could not remove the repo directory")
+            }
+        }
+    }
+}
+
 /// True for exactly 40 lowercase hex characters.
 pub fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -293,6 +316,8 @@ pub fn is_full_sha(s: &str) -> bool {
 ///
 /// Once the request is checked, the push is registered in `state.pushes`, which tracks its
 /// progress for the admin page and records how it ended.
+/// All database changes commit together; errors and cancellation roll them back. The checkout
+/// is live, not part of that transaction: grep/read_file do not share search's snapshot guarantee.
 pub async fn ingest_bundle(
     state: &AppState,
     source: &Source,
@@ -357,28 +382,67 @@ async fn ingest_locked(
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
     ensure_mirror(&paths).await?;
     fetch_bundle(&paths, bundle_arg, expected_ref).await?;
+    index_commit(state, &source, &paths, expected_ref, full, push).await
+}
+
+/// Indexes `commit`, which the mirror already holds, and records it as the source's indexed
+/// commit. `full` (or a source never indexed before) indexes the whole tree; otherwise only the
+/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit.
+/// The caller holds the source's lock and passes the source as read under it.
+async fn index_commit(
+    state: &AppState,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    full: bool,
+    push: &PushHandle,
+) -> Result<IndexReport, IngestError> {
     paths
-        .mirror_git(&["update-ref", "refs/heads/lore-indexed", expected_ref])
+        .mirror_git(&["update-ref", "refs/heads/lore-indexed", commit])
         .await?;
 
     let full_mode = full || source.indexed_commit.is_none();
     let changes = if full_mode {
-        Changes::from_tree(&paths, expected_ref).await?
+        Changes::from_tree(paths, commit).await?
     } else {
         // `indexed_commit` is only None in full mode, so it is set here.
         let indexed = source.indexed_commit.as_deref().unwrap_or_default();
-        Changes::from_diff(&paths, indexed, expected_ref).await?
+        Changes::from_diff(paths, indexed, commit).await?
     };
 
-    refresh_checkout(&paths, expected_ref).await?;
+    refresh_checkout(paths, commit).await?;
 
+    // MVCC keeps the old repo visible until every document and the commit pointer are ready.
+    // Keep all lookups on this connection: even a one-connection pool can finish a push.
+    let mut tx = state.pool.begin().await?;
+    // Parent first: a tenant cascade must not lock the tenant while we hold its source and
+    // subsequently need a tenant FK lock for newly inserted chunks.
+    let tenant: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1 FOR KEY SHARE")
+            .bind(source.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if tenant.is_none() {
+        return Err(anyhow!("tenant {} vanished", source.tenant_id).into());
+    }
+    let owned: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
+            .bind(source.id)
+            .bind(source.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owned.is_none() {
+        return Err(anyhow!("source {} vanished", source.id).into());
+    }
     let mut job = Job {
         state,
-        source: &source,
-        paths: &paths,
-        commit: expected_ref,
+        tx,
+        pending: PendingEmbeddings::default(),
+        source,
+        paths,
+        commit,
         report: IndexReport {
-            indexed_commit: expected_ref.to_string(),
+            indexed_commit: commit.to_string(),
             files_indexed: 0,
             files_unchanged: 0,
             files_skipped: changes.skipped_paths,
@@ -403,7 +467,9 @@ async fn ingest_locked(
         job.delete_vanished().await?;
     }
 
-    set_indexed_commit(&state.pool, source.id, expected_ref).await?;
+    set_indexed_commit(&mut *job.tx, source.id, commit).await?;
+    job.tx.commit().await?;
+    job.pending.publish(&state.pool).await;
     Ok(job.report)
 }
 
@@ -714,6 +780,8 @@ struct DocMetadata<'a> {
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
     state: &'a AppState,
+    tx: Transaction<'static, Postgres>,
+    pending: PendingEmbeddings,
     source: &'a Source,
     paths: &'a RepoPaths,
     commit: &'a str,
@@ -754,7 +822,7 @@ impl Job<'_> {
         };
 
         let content_hash = file_hash(&content);
-        let known = document_hash(&self.state.pool, self.source.id, path).await?;
+        let known = document_hash(&mut *self.tx, self.source.id, path).await?;
         if known.as_deref() == Some(content_hash.as_str()) {
             self.report.files_unchanged += 1;
             self.kept.insert(path.to_string());
@@ -785,15 +853,8 @@ impl Job<'_> {
             body: None,
         };
         let chunks = chunk_file(path, &content);
-        let stats = index_text_with_stats(
-            self.state,
-            self.source.tenant_id,
-            self.source,
-            doc,
-            chunks,
-            path,
-        )
-        .await?;
+        let stats =
+            index_repo_text(self.state, &mut self.tx, &mut self.pending, doc, chunks).await?;
         self.report.files_indexed += 1;
         self.report.chunks += stats.chunks;
         self.totals.chunks += stats.chunks;
@@ -812,16 +873,14 @@ impl Job<'_> {
         Ok(())
     }
 
-    async fn delete_doc(&self, path: &str) -> Result<bool, IngestError> {
-        let mut tx = self.state.pool.begin().await?;
-        let deleted = delete_document(&mut tx, self.source.id, path).await?;
-        tx.commit().await?;
+    async fn delete_doc(&mut self, path: &str) -> Result<bool, IngestError> {
+        let deleted = delete_document(&mut self.tx, self.source.id, path).await?;
         Ok(deleted)
     }
 
     /// Full mode: deletes the documents of paths that are not in the new tree.
     async fn delete_vanished(&mut self) -> Result<(), IngestError> {
-        for id in list_external_ids(&self.state.pool, self.source.id).await? {
+        for id in list_external_ids(&mut *self.tx, self.source.id).await? {
             if !self.kept.contains(&id) && self.delete_doc(&id).await? {
                 self.report.files_deleted += 1;
             }
