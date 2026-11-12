@@ -70,6 +70,8 @@ fn chunk(text: &str, start: u32, end: u32, symbols: &[&str]) -> Chunk {
         enumerates: false,
         sql_subjects: Vec::new(),
         sql_identities: Vec::new(),
+        is_test: false,
+        is_generated: false,
         defines: Vec::new(),
         calls: Vec::new(),
     }
@@ -159,6 +161,174 @@ async fn plan_limits_ranks_plans_rs_first_with_the_documented_shape(pool: PgPool
         "the top hit is in more than one list"
     );
     assert!(scores[0] <= 3.0 / 61.0 + 1e-12);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ranking_flags_lower_test_and_generated_hits_but_never_hide_them(pool: PgPool) {
+    let (state, router, tenant, key) = setup(pool).await;
+    let text = "receiver queue capacity helm values";
+    for path in ["tests/receiver.txt", "gen/receiver.txt", "src/receiver.txt"] {
+        add_doc(
+            &state,
+            tenant,
+            "product",
+            path,
+            "code",
+            "receiver",
+            None,
+            lore::chunk::chunk_file(path, text),
+        )
+        .await;
+    }
+    let flags: Vec<(bool, bool)> =
+        sqlx::query_as("SELECT is_test, is_generated FROM chunks WHERE tenant_id = $1 ORDER BY id")
+            .bind(tenant)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(flags, [(true, false), (false, true), (false, false)]);
+    let found = hits(&router, &key, text, "&k=50").await;
+    assert_eq!(
+        found.len(),
+        3,
+        "same-source duplicates keep their locations"
+    );
+    // The production chunk was inserted last: the prior overcomes the lexical id tie-break.
+    assert!(found[0]["score"].as_f64().unwrap() > found[1]["score"].as_f64().unwrap());
+    let prod_id: i64 = sqlx::query_scalar("SELECT max(id) FROM chunks WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(found[0]["chunk_id"], prod_id);
+    let test_query = hits(&router, &key, "receiver queue tests", "&k=50").await;
+    let test_id: i64 = sqlx::query_scalar("SELECT min(id) FROM chunks WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(test_query[0]["chunk_id"], test_id);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn duplicate_text_collapses_before_k_with_scoped_provenance(pool: PgPool) {
+    let (state, router, tenant, key) = setup(pool).await;
+    for source in ["registry", "sdk-one", "sdk-two"] {
+        add_doc(
+            &state,
+            tenant,
+            source,
+            "constants",
+            "code",
+            "agent constants",
+            None,
+            vec![chunk(
+                "agent span constants session tool completion",
+                1,
+                1,
+                &[],
+            )],
+        )
+        .await;
+    }
+    add_doc(
+        &state,
+        tenant,
+        "plugin",
+        "emit",
+        "code",
+        "agent implementation",
+        None,
+        vec![chunk("agent span emitter implementation", 1, 1, &[])],
+    )
+    .await;
+    // A short identical prefix is not a duplicate of a different full passage.
+    add_doc(
+        &state,
+        tenant,
+        "other",
+        "long",
+        "code",
+        "agent implementation",
+        None,
+        vec![chunk(
+            "agent span emitter implementation\nextra behavior",
+            1,
+            2,
+            &[],
+        )],
+    )
+    .await;
+    let (other_tenant, other_key) =
+        create_tenant_key(&router, "private", &["read", "ingest"]).await;
+    add_doc(
+        &state,
+        other_tenant,
+        "secret",
+        "constants",
+        "code",
+        "agent constants",
+        None,
+        vec![chunk(
+            "agent span constants session tool completion",
+            1,
+            1,
+            &[],
+        )],
+    )
+    .await;
+    add_doc(
+        &state,
+        tenant,
+        "doc-copy",
+        "constants",
+        "note",
+        "agent constants",
+        None,
+        vec![chunk(
+            "agent span constants session tool completion",
+            1,
+            1,
+            &[],
+        )],
+    )
+    .await;
+    let found = hits(&router, &key, "agent span constants", "&k=3").await;
+    assert_eq!(found.len(), 3, "fill k after collapsing duplicate copies");
+    let duplicate = found
+        .iter()
+        .find(|h| h["also_in"].as_array().unwrap().len() == 3)
+        .unwrap();
+    let mut sources = duplicate["also_in"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect::<Vec<_>>();
+    sources.push(duplicate["source"].as_str().unwrap());
+    sources.sort();
+    assert_eq!(sources, ["doc-copy", "registry", "sdk-one", "sdk-two"]);
+    let code_only = hits(&router, &key, "agent span constants", "&kind=code&k=50").await;
+    assert!(code_only.iter().all(|h| {
+        h["kind"] == "code"
+            && !h["also_in"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("doc-copy"))
+    }));
+    let scoped = hits(
+        &router,
+        &key,
+        "agent span constants",
+        "&source=sdk-two&k=50",
+    )
+    .await;
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0]["source"], "sdk-two");
+    assert_eq!(scoped[0]["also_in"], json!([]));
+    let private = hits(&router, &other_key, "agent span constants", "&k=50").await;
+    assert_eq!(private.len(), 1);
+    assert_eq!(private[0]["also_in"], json!([]));
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -4,6 +4,9 @@ lore finds the relevant code once, when you index, so a question skips the grep-
 
 ## Highlights
 
+The [multi-repo ranking eval](search-ranking.md#reproducing-the-multi-repo-regression-eval)
+adds unscoped fixture/generated/docs-vs-code regression questions to the public retrieval set.
+
 - **fast** answers in 5 to 8 seconds, 3 to 7 times sooner than Claude Code.
 - **deep** matched Claude Code's answers on every question we scored, and was faster in 4 of 5 runs.
 - **One index covers every repo you push**, so an answer can connect a service to the client that calls it.

@@ -2,14 +2,15 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    bundle, create_repo, create_tenant_key, fixture_repo, git, head, put_bundle, send, test_router,
-    test_state,
+    bundle, commit_all, create_repo, create_tenant_key, fixture_repo, git, head, put_bundle, send,
+    test_router, test_state,
 };
 use lore::chunk::chunk_file;
 use lore::http::AppState;
 use lore::search::{Hit, SearchQuery, search};
 use lore::store::{IndexedChunk, NewDocument, ensure_source, index_text, replace_chunks};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -24,7 +25,13 @@ async fn sql(state: &AppState, tenant: Uuid, source: &str, path: &str, text: &st
         NewDocument {
             tenant_id: tenant,
             source_id: source.id,
-            external_id: path.into(),
+            // Document IDs and metadata paths are independent store inputs. Keep the ID small
+            // when testing full metadata paths beyond the existing document-ID B-tree limit.
+            external_id: if path.len() > 2048 {
+                format!("path-{:x}", Sha256::digest(path.as_bytes()))
+            } else {
+                path.into()
+            },
             kind: "code".into(),
             title: path.into(),
             uri: None,
@@ -82,7 +89,7 @@ async fn current_values_search_and_both_answer_modes_include_the_change(pool: Pg
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].path.as_deref(), Some("migrations/002_archived.sql"));
     assert_eq!(hits[1].path.as_deref(), Some("migrations/001_accounts.sql"));
-    assert_eq!(hits[1].later_changes, ["migrations/002_archived.sql"]);
+    assert_eq!(hits[1].later_changes, ["app:migrations/002_archived.sql"]);
     assert!(hits[0].text.contains("'archived'"));
     let (status, body) = send(
         &router,
@@ -116,7 +123,7 @@ async fn current_values_search_and_both_answer_modes_include_the_change(pool: Pg
             body["answer"]
                 .as_str()
                 .unwrap()
-                .contains("later SQL changes in `migrations/002_archived.sql`"),
+                .contains("later SQL changes in `app:migrations/002_archived.sql`"),
             "{body}"
         );
         assert!(
@@ -134,7 +141,10 @@ async fn current_values_search_and_both_answer_modes_include_the_change(pool: Pg
     }
     let smallest = find(&state, tenant, "account statuses", 1).await;
     assert_eq!(smallest.len(), 1);
-    assert_eq!(smallest[0].path.as_deref(), Some("migrations/002_archived.sql"));
+    assert_eq!(
+        smallest[0].path.as_deref(),
+        Some("migrations/002_archived.sql")
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -168,7 +178,8 @@ async fn collapsed_sql_alias_keeps_its_own_source_chronology(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn cross_source_duplicates_do_not_erase_repeated_migration_positions(pool: PgPool) {
     let state = test_state(pool, &std::env::temp_dir());
-    let (tenant, _) = create_tenant_key(&test_router(state.clone()), "sql-history", &["read"]).await;
+    let (tenant, _) =
+        create_tenant_key(&test_router(state.clone()), "sql-history", &["read"]).await;
     sql(&state, tenant, "a", "001.sql", CREATE).await;
     sql(&state, tenant, "a", "002.sql", CREATE).await;
     sql(&state, tenant, "b", "001.sql", CREATE).await;
@@ -176,16 +187,34 @@ async fn cross_source_duplicates_do_not_erase_repeated_migration_positions(pool:
     for k in [1, 2, 3, 5] {
         let hits = find_in(&state, tenant, "account statuses", k, None).await;
         assert!(hits.len() <= k, "{k}: {hits:?}");
-        if let Some(old) = hits.iter().position(|h| h.path.as_deref() == Some("001.sql")) {
-            assert!(hits[..old].iter().any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql")), "{k}: {hits:?}");
-            assert!(hits[..old].iter().any(|h| h.source == "b" && h.path.as_deref() == Some("003.sql")), "{k}: {hits:?}");
+        if let Some(old) = hits
+            .iter()
+            .position(|h| h.path.as_deref() == Some("001.sql"))
+        {
+            assert!(
+                hits[..old]
+                    .iter()
+                    .any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql")),
+                "{k}: {hits:?}"
+            );
+            assert!(
+                hits[..old]
+                    .iter()
+                    .any(|h| h.source == "b" && h.path.as_deref() == Some("003.sql")),
+                "{k}: {hits:?}"
+            );
             assert!(hits[old].later_changes.contains(&"a:002.sql".into()));
             assert!(hits[old].later_changes.contains(&"b:003.sql".into()));
         }
         if k == 5 {
             assert_eq!(hits.len(), 3, "{hits:?}");
-            assert!(hits.iter().any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql") && h.later_changes.is_empty()));
-            assert!(hits.iter().any(|h| h.path.as_deref() == Some("001.sql") && h.also_in == ["b"]));
+            assert!(hits.iter().any(|h| h.source == "a"
+                && h.path.as_deref() == Some("002.sql")
+                && h.later_changes.is_empty()));
+            assert!(
+                hits.iter()
+                    .any(|h| h.path.as_deref() == Some("001.sql") && h.also_in == ["b"])
+            );
         }
     }
 }
@@ -193,7 +222,8 @@ async fn cross_source_duplicates_do_not_erase_repeated_migration_positions(pool:
 #[sqlx::test(migrations = "./migrations")]
 async fn collapsed_newest_companions_keep_both_sources_and_warnings(pool: PgPool) {
     let state = test_state(pool, &std::env::temp_dir());
-    let (tenant, _) = create_tenant_key(&test_router(state.clone()), "sql-companions", &["read"]).await;
+    let (tenant, _) =
+        create_tenant_key(&test_router(state.clone()), "sql-companions", &["read"]).await;
     for source in ["a", "b"] {
         sql(&state, tenant, source, "001.sql", CREATE).await;
         sql(&state, tenant, source, "003.sql", ALTER).await;
@@ -334,12 +364,12 @@ async fn enum_alter_multi_object_drop_and_case_folded_names_are_followed(pool: P
         .iter()
         .find(|h| h.text.contains("CREATE TYPE"))
         .unwrap();
-    assert_eq!(old_enum.later_changes, ["002.sql"]);
+    assert_eq!(old_enum.later_changes, ["app:002.sql"]);
     let old_table = hits
         .iter()
         .find(|h| h.text.contains("CREATE TABLE"))
         .unwrap();
-    assert_eq!(old_table.later_changes, ["002.sql"]);
+    assert_eq!(old_table.later_changes, ["app:002.sql"]);
     let newest_enum = hits
         .iter()
         .position(|h| h.text.contains("ADD VALUE"))
@@ -401,7 +431,7 @@ async fn quoted_case_does_not_link_distinct_objects_despite_folded_subject_keys(
         .iter()
         .find(|h| h.path.as_deref() == Some("001.sql"))
         .unwrap();
-    assert_eq!(original.later_changes, ["003.sql"]);
+    assert_eq!(original.later_changes, ["app:003.sql"]);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -432,10 +462,10 @@ async fn lookup_rows_replace_delete_and_rollback_with_chunks(pool: PgPool) {
     assert_eq!(inside, ["table:\"public\".\"temporary\""]);
     // Readers on another connection still see all-old SQL subjects while replacement is pending.
     let hits = find(&state, tenant, "account statuses", 5).await;
-    assert!(hits.iter().any(|h| h.later_changes == ["002.sql"]));
+    assert!(hits.iter().any(|h| h.later_changes == ["app:002.sql"]));
     tx.rollback().await.unwrap();
     let hits = find(&state, tenant, "account statuses", 5).await;
-    assert!(hits.iter().any(|h| h.later_changes == ["002.sql"]));
+    assert!(hits.iter().any(|h| h.later_changes == ["app:002.sql"]));
     sql(
         &state,
         tenant,
@@ -513,7 +543,7 @@ async fn long_identity_and_path_boundaries_keep_chronology_complete(pool: PgPool
                 hits[0].text.contains("latest_marker"),
                 "{identity_bytes}/{path_bytes}"
             );
-            assert_eq!(hits[1].later_changes, [latest]);
+            assert_eq!(hits[1].later_changes, [format!("app:{latest}")]);
             sqlx::query("DELETE FROM tenants WHERE id = $1")
                 .bind(tenant)
                 .execute(&state.pool)
@@ -552,7 +582,7 @@ async fn subjects_after_sixty_four_and_hash_collisions_do_not_lose_or_mislink_ch
         .await;
         let hits = find(&state, tenant, "what state columns are there?", 5).await;
         assert_eq!(hits[0].path.as_deref(), Some("002.sql"));
-        assert_eq!(hits[1].later_changes, ["002.sql"]);
+        assert_eq!(hits[1].later_changes, ["app:002.sql"]);
     }
     let (tenant, _) = create_tenant_key(&router, "collisions", &["read"]).await;
     sql(&state, tenant, "app", "001.sql", CREATE).await;
@@ -585,7 +615,7 @@ async fn subjects_after_sixty_four_and_hash_collisions_do_not_lose_or_mislink_ch
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn real_bundle_ingest_accepts_and_surfaces_a_long_git_path(pool: PgPool) {
+async fn real_bundle_ingest_rejects_invalid_paths_atomically_and_indexes_valid_sql(pool: PgPool) {
     let data = tempfile::tempdir().unwrap();
     let state = test_state(pool, data.path());
     let router = test_router(state.clone());
@@ -627,13 +657,49 @@ async fn real_bundle_ingest_accepts_and_surfaces_a_long_git_path(pool: PgPool) {
         true,
     )
     .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{report}");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sql_subject_lookup WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0);
+    let indexed: Option<String> =
+        sqlx::query_scalar("SELECT indexed_commit FROM sources WHERE id = $1")
+            .bind(source_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(indexed.is_none());
+
+    // Git's existing strict fsck rejects the oversized component above. A valid nested
+    // path stays within this host's checkout limits, while still exceeding API ID limits.
+    let repo = fixture_repo();
+    let long = format!("migrations/{}latest.sql", "nested_component/".repeat(40));
+    assert!(long.len() > 512 && long.len() < 800);
+    let initial = repo.path().join("migrations/001.sql");
+    let latest = repo.path().join(&long);
+    std::fs::create_dir_all(latest.parent().unwrap()).unwrap();
+    std::fs::write(initial, CREATE).unwrap();
+    std::fs::write(latest, ALTER).unwrap();
+    commit_all(&repo, "Fixture: Add valid SQL migration paths");
+    let (status, report) = put_bundle(
+        &router,
+        &key,
+        source_id,
+        bundle(&repo, &["HEAD"]),
+        &head(&repo),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{report}");
     let hits = find(&state, tenant, "which statuses can an account be in?", 5).await;
     let original = hits
         .iter()
         .find(|h| h.path.as_deref() == Some("migrations/001.sql"))
         .unwrap();
-    assert_eq!(original.later_changes, [long]);
+    assert_eq!(original.later_changes, [format!("app:{long}")]);
     assert!(
         hits.iter()
             .position(|h| h.text.contains("'archived'"))
@@ -660,7 +726,7 @@ async fn newest_compares_normal_and_overflow_paths_and_last_chunk_in_a_file(pool
         .iter()
         .find(|h| h.path.as_deref() == Some("a.sql"))
         .unwrap();
-    assert_eq!(original.later_changes, ["z.sql"]);
+    assert_eq!(original.later_changes, ["app:z.sql"]);
     let mut ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -675,6 +741,6 @@ async fn newest_compares_normal_and_overflow_paths_and_last_chunk_in_a_file(pool
         .iter()
         .find(|h| h.path.as_deref() == Some("a.sql"))
         .unwrap();
-    assert_eq!(original.later_changes, [overflow]);
+    assert_eq!(original.later_changes, [format!("app:{overflow}")]);
     assert!(hits[0].text.contains("'archived'"));
 }

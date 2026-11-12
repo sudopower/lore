@@ -420,6 +420,9 @@ fn render_hit(n: usize, h: &Hit, terms: &[String]) -> String {
         about = format!("{about}: {symbols}");
     }
     let mut out = format!("[{n}] {} {place} ({about}) id={}", h.source, h.document_id);
+    if !h.also_in.is_empty() {
+        out.push_str(&format!("; also in: {}", h.also_in.join(", ")));
+    }
     for line in excerpt(&h.text, h.start_line, terms) {
         out.push('\n');
         out.push_str(&line);
@@ -738,6 +741,7 @@ mod tests {
             chunk_id: 1,
             document_id: Uuid::nil(),
             source: "sample".to_string(),
+            also_in: Vec::new(),
             kind: "code".to_string(),
             title: "Standup notes".to_string(),
             uri: None,
@@ -770,6 +774,13 @@ mod tests {
             )),
             "{header}"
         );
+    }
+
+    #[test]
+    fn a_hit_names_duplicate_sources() {
+        let mut h = hit(Some("gen/agent.py"), &[]);
+        h.also_in = vec!["sdk".to_string()];
+        assert!(render_hit(1, &h, &[]).contains("; also in: sdk"));
     }
 
     #[test]

@@ -1,0 +1,35 @@
+{
+  "about": "Hand-written miniature product, not extracted search results. Gold labels name the authoritative implementation or explicitly requested test/docs. Generated SDKs intentionally share exact output; QA exports repeat realistic configuration examples from a different source.",
+  "sources": {
+    "platform": {
+      "charts/receiver/templates/configmap.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: receiver-config\ndata:\n  receiver.yaml: |\n    listen: {{ .Values.receiver.listen | default \"0.0.0.0:4318\" }}\n    batch_size: {{ .Values.receiver.batchSize | default 512 }}\n    queue_capacity: {{ .Values.receiver.queueCapacity | default 4096 }}\n",
+      "charts/receiver/values.yaml": "receiver:\n  listen: 0.0.0.0:4318\n  batchSize: 512\n  queueCapacity: 4096\n",
+      "src/toolsets.py": "def validate_toolset(tools):\n    \"\"\"Reject oversized toolsets before registration.\"\"\"\n    if len(tools) > 32:\n        raise ValueError(\"toolset contains more than 32 tools\")\n    return tools\n",
+      "src/payload.py": "def accept_payload(body):\n    \"\"\"The receiver rejects a payload larger than one mebibyte.\"\"\"\n    if len(body) > 1024 * 1024:\n        raise ValueError(\"payload exceeds receiver byte limit\")\n    return body\n",
+      "src/retries.py": "def retry_delay(attempt):\n    \"\"\"Receiver retries use exponential backoff capped at thirty seconds.\"\"\"\n    return min(30, 2 ** attempt)\n",
+      "README.md": "# Platform\n\n## Toolset limits\nToolsets support up to 128 tools. Registration accepts every toolset within that limit.\n\n## Receiver payload limits\nThe receiver accepts payloads up to eight mebibytes. Larger payloads are rejected.\n\n## Receiver retry policy\nReceiver retries always wait five seconds before sending again.\n\n## Installation\nInstall the receiver chart with helm install receiver ./charts/receiver.\n",
+      "tests/test_toolsets.py": "def test_toolset_limit():\n    \"\"\"A toolset containing 33 tools must be rejected.\"\"\"\n    with raises(ValueError):\n        validate_toolset([\"tool\"] * 33)\n",
+      "tests/test_payload.py": "def test_receiver_payload_limit():\n    \"\"\"Receiver payloads above one mebibyte must be rejected.\"\"\"\n    with raises(ValueError):\n        accept_payload(b\"x\" * (1024 * 1024 + 1))\n"
+    },
+    "coding-plugin": {
+      "src/telemetry.py": "def send_agent_spans(tracer, session):\n    \"\"\"The coding-agent plugin sends session, tool-call and completion spans.\"\"\"\n    for name in (\"agent.session\", \"agent.tool_call\", \"agent.completion\"):\n        tracer.emit(name, session=session)\n",
+      "src/attributes.py": "def attach_agent_attributes(span, session, model):\n    \"\"\"Every coding-agent span carries session.id and model.name attributes.\"\"\"\n    span.set_attribute(\"session.id\", session.id)\n    span.set_attribute(\"model.name\", model.name)\n",
+      "src/errors.py": "def record_agent_error(span, error):\n    \"\"\"The coding-agent plugin records error.type and marks failed spans ERROR.\"\"\"\n    span.set_attribute(\"error.type\", type(error).__name__)\n    span.set_status(\"ERROR\")\n",
+      "docs/telemetry.md": "# Telemetry guide\nThe coding-agent plugin reports work through the receiver. To inspect telemetry locally, start the collector and set OTEL_EXPORTER_OTLP_ENDPOINT to http://localhost:4318.\n"
+    },
+    "registry": {
+      "gen/agent_generated.py": "# Code generated from agent telemetry schema. DO NOT EDIT.\nAGENT_SPANS = (\"agent.session\", \"agent.tool_call\", \"agent.completion\")\nAGENT_ATTRIBUTES = (\"session.id\", \"model.name\")\nAGENT_ERROR = (\"error.type\", \"ERROR\")\n"
+    },
+    "sdk-python": {
+      "gen/agent_generated.py": "# Code generated from agent telemetry schema. DO NOT EDIT.\nAGENT_SPANS = (\"agent.session\", \"agent.tool_call\", \"agent.completion\")\nAGENT_ATTRIBUTES = (\"session.id\", \"model.name\")\nAGENT_ERROR = (\"error.type\", \"ERROR\")\n"
+    },
+    "sdk-browser": {
+      "gen/agent_generated.py": "# Code generated from agent telemetry schema. DO NOT EDIT.\nAGENT_SPANS = (\"agent.session\", \"agent.tool_call\", \"agent.completion\")\nAGENT_ATTRIBUTES = (\"session.id\", \"model.name\")\nAGENT_ERROR = (\"error.type\", \"ERROR\")\n"
+    },
+    "qa-exports": {
+      "fixtures/receiver.jsonl": "{\"case\":\"helm receiver values\", \"receiver\":{\"listen\":\"0.0.0.0:4318\",\"batchSize\":512,\"queueCapacity\":4096}}\n{\"case\":\"helm receiver configmap\", \"receiver\":{\"listen\":\"127.0.0.1:4318\",\"batchSize\":128,\"queueCapacity\":1024}}\n",
+      "testdata/receiver.yaml": "# Helm values for the receiver in integration tests\nreceiver:\n  listen: 127.0.0.1:4318\n  batchSize: 128\n  queueCapacity: 1024\n",
+      "__snapshots__/receiver.yaml": "# Receiver configmap helm values snapshot\nreceiver:\n  listen: localhost:4318\n  batchSize: 64\n  queueCapacity: 256\n"
+    }
+  }
+}

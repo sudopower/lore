@@ -57,7 +57,9 @@ For each question the eval calls `GET /v1/search?q=<q>&k=50&source=<repo>` once 
  ]}
 ```
 
-- `repo` is the source name the repo was pushed as, and the `source` filter of the search.
+- `repo` is the gold source name and normally the `source` filter of the search.
+- `unscoped: true` omits that filter while still scoring against `repo`. See the fixed
+  fifteen-question [multi-repo ranking eval](../../docs/search-ranking.md).
 - `category` is one of `enumeration` (which X are there), `schema` (tables, fields, types), `where` (which file or function does X), `config` (settings and defaults) and `how` (how something works).
 - `gold` lists line ranges, 1-based and inclusive. A range without `start` and `end` stands for the whole file. `need` is `any` (the default) or `all`.
 - `answer` is the reference answer. The search eval does not read it; the agent comparison grades against it.

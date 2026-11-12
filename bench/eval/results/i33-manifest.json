@@ -1,0 +1,69 @@
+{
+  "baseline_commit": "ad4654b4be31da2543fb6b0a389c7872636f0b1d",
+  "branch_commit": "a2eafaa0d49c0f545ffaf42de8127c4d893a54cf",
+  "profile": "debug, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=2",
+  "model_snapshot": "ea104dacec62c0de699686887e3f920caeb4f3e3",
+  "binary_sha256": {
+    "baseline": "d4222d6e97a6e1f237ccd4d858488bcf86f86cf8540828fd9a45d5f707ddaafb",
+    "no-readme": "30b8391e0cc43d61c627c6fa5c4150f799ea4b848bd58a02a7b04124bc40d576",
+    "ranking": "acbf86529a9dae37a569e73ed370930ddaedfac720e23cafbc4a3116337153a4"
+  },
+  "baseline_runtime": {
+    "version": "i33-baseline-ad4654b",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "ablation_runtime": {
+    "version": "i33-no-readme-a2eafaa",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "ranking_runtime": {
+    "version": "i33-ranking-a2eafaa",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "corpus_sha256": "9341baccc91928bc2e9c40c6d94e2c55fd591c45551a08eaa5d59aca8dee6e5e",
+  "question_sha256": {
+    "public20": "ae6f6dcfdaf65eb33159b7e4d1068394bda64b440b347b543ac7e8aec9eaf7c1",
+    "multi15": "b59dcf2523dee940b3a6035831f0b0e3c5a588b86716bb49c22ccc49385f3001"
+  },
+  "production_source_sha256": {
+    "src/search.rs": "54fc6766380bd3e2dd752863f4946f71c62386e39fc1f58a77e3a79d350971d3",
+    "src/store.rs": "980c7400b6ca429e892dd7bc88bd5faeb609f718a6c1f071a3699858b8c4d44f",
+    "src/chunk/mod.rs": "a04f5c71de5e96de58e82cea310c8d3aaec83efc3b4fe91880b2a25f71ed97b3"
+  },
+  "validation": {
+    "commands": [
+      "make lint",
+      "make test"
+    ],
+    "rust_passed": 687,
+    "rust_ignored": 5,
+    "python": "33 harness tests covered: 32 passed initially, the fixture-bound failure corrected before evaluation and targeted recheck passed; amended unscoped-source test passed after its final edit",
+    "runtime_proof": "i33-runtime-proof.json",
+    "cleanup": "owned servers stopped; repository compose down without volume removal"
+  },
+  "notes": [
+    "Public20 is the explicitly approved substitute for the unavailable historical private33 set.",
+    "Both corpora were indexed once by the baseline server; branch runs reused the same database vectors and source commits.",
+    "The no-readme ablation changed only the README score multiplier from 0.9 to 1.0.",
+    "Gold-bound corrections preceded all measured runs. Production source remained unchanged after measurements; subsequent changes affect tests, docs and recorded results only.",
+    "One-pass k=50 measurements include first-call latency separately; no large-index latency guarantee is claimed."
+  ]
+}

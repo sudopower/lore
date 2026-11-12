@@ -142,6 +142,7 @@ mod tests {
             chunk_id: 1,
             document_id: Uuid::new_v4(),
             source: "sample".to_string(),
+            also_in: Vec::new(),
             kind: "code".to_string(),
             title: format!("title of {path}"),
             uri: uri.map(str::to_string),

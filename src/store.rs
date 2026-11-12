@@ -428,17 +428,17 @@ async fn insert_chunk(
     sqlx::query(
         "WITH added AS (INSERT INTO chunks
            (tenant_id, document_id, ord, text, start_line, end_line, symbols, tsv, embedding,
-            enumerates, defines, calls, sql_subjects)
+            enumerates, is_test, is_generated, defines, calls, sql_subjects)
          VALUES ($1, $2, $3, $4, $5, $6, $7,
                  setweight(to_tsvector('english', $8::text), 'A')
                    || setweight(to_tsvector('english', $9::text), 'B'),
-                 $10, $11, $12, $13, $14)
+                 $10, $11, $12, $13, $14, $15, $16)
          RETURNING id)
          INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, identity_hash, path, ord)
          SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, subjects.identity_hash, d.metadata->>'path', $3
          FROM added
          JOIN documents d ON d.id = $2
-         CROSS JOIN unnest($14::text[], $15::text[], $16::bytea[]) AS subjects(subject, identity, identity_hash)
+         CROSS JOIN unnest($16::text[], $17::text[], $18::bytea[]) AS subjects(subject, identity, identity_hash)
          WHERE d.metadata->>'path' IS NOT NULL",
     )
     .bind(tenant_id)
@@ -452,6 +452,8 @@ async fn insert_chunk(
     .bind(&c.lexical)
     .bind(Vector::from(c.embedding.clone()))
     .bind(c.chunk.enumerates)
+    .bind(c.chunk.is_test)
+    .bind(c.chunk.is_generated)
     .bind(&c.chunk.defines)
     .bind(&c.chunk.calls)
     .bind(&c.chunk.sql_subjects)
