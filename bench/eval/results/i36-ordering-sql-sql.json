@@ -1,0 +1,305 @@
+{
+  "label": "i36-ordering-sql-sql",
+  "date": "2026-11-12T21:39:22+00:00",
+  "url": "http://127.0.0.1:8096",
+  "k": 50,
+  "server": {
+    "version": "0.1.0",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "sets": [
+    {
+      "file": "bench/eval/questions/sql-chronology.json",
+      "commits": {},
+      "questions": 12
+    }
+  ],
+  "latency_ms_median": 19.5,
+  "latency_ms_first": 27.5,
+  "latency_ms_max": 29.5,
+  "summary": {
+    "overall": {
+      "n": 12,
+      "hit@5": 12,
+      "hit@12": 12,
+      "hit@50": 12,
+      "mrr": 0.479
+    },
+    "categories": {
+      "enumeration": {
+        "n": 4,
+        "hit@5": 4,
+        "hit@12": 4,
+        "hit@50": 4,
+        "mrr": 0.5
+      },
+      "schema": {
+        "n": 8,
+        "hit@5": 8,
+        "hit@12": 8,
+        "hit@50": 8,
+        "mrr": 0.469
+      }
+    }
+  },
+  "questions": [
+    {
+      "id": "sql-check",
+      "repo": "sql-chronology",
+      "category": "enumeration",
+      "need": "all",
+      "q": "which statuses can an account be in?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        2,
+        1
+      ],
+      "latency_ms": 17.5,
+      "top": [
+        "migrations/010_accounts.sql:1-2",
+        "migrations/001_initial.sql:1-1",
+        "migrations/001_initial.sql:4-4",
+        "migrations/040_audit.sql:1-1",
+        "migrations/001_initial.sql:3-3"
+      ]
+    },
+    {
+      "id": "sql-enum",
+      "repo": "sql-chronology",
+      "category": "enumeration",
+      "need": "all",
+      "q": "what values are allowed for shipment_stage?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        2,
+        1
+      ],
+      "latency_ms": 23.7,
+      "top": [
+        "migrations/020_shipments.sql:1-1",
+        "migrations/001_initial.sql:2-2",
+        "migrations/001_initial.sql:10-10",
+        "migrations/090_table.sql:1-1",
+        "migrations/001_initial.sql:11-11"
+      ]
+    },
+    {
+      "id": "sql-drop",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "does the retired_devices table still exist?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 26.1,
+      "top": [
+        "migrations/001_initial.sql:3-3",
+        "migrations/030_retirement.sql:1-1",
+        "migrations/001_initial.sql:12-12",
+        "migrations/055_quoted_case.sql:1-1",
+        "migrations/001_initial.sql:5-5"
+      ]
+    },
+    {
+      "id": "sql-audit",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "what columns does audit.accounts have?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 29.5,
+      "top": [
+        "migrations/001_initial.sql:4-4",
+        "migrations/040_audit.sql:1-1",
+        "migrations/010_accounts.sql:1-2",
+        "migrations/001_initial.sql:1-1",
+        "migrations/070_quoted.sql:1-1"
+      ]
+    },
+    {
+      "id": "sql-case",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "where is the maintenance_reason column on app.device_state added?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 19.4,
+      "top": [
+        "migrations/001_initial.sql:5-5",
+        "migrations/050_devices.sql:1-1",
+        "migrations/001_initial.sql:12-12",
+        "migrations/055_quoted_case.sql:1-1",
+        "migrations/001_initial.sql:3-3"
+      ]
+    },
+    {
+      "id": "sql-default-schema",
+      "repo": "sql-chronology",
+      "category": "enumeration",
+      "need": "all",
+      "q": "what tiers are allowed in plans now?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        2,
+        1
+      ],
+      "latency_ms": 18.7,
+      "top": [
+        "migrations/060_plans.sql:1-2",
+        "migrations/001_initial.sql:6-6",
+        "migrations/020_shipments.sql:1-1",
+        "migrations/001_initial.sql:2-2",
+        "migrations/010_accounts.sql:1-2"
+      ]
+    },
+    {
+      "id": "sql-quoted-dot",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "what columns does public.\"event.log\" contain?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 17.3,
+      "top": [
+        "migrations/001_initial.sql:7-7",
+        "migrations/070_quoted.sql:1-1",
+        "migrations/001_initial.sql:8-8",
+        "migrations/075_schema.sql:1-1",
+        "migrations/001_initial.sql:12-12"
+      ]
+    },
+    {
+      "id": "sql-qualified-dot",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "what columns does the log table in the event schema contain?",
+      "rank": 4,
+      "unscoped": false,
+      "gold_ranks": [
+        3,
+        4
+      ],
+      "latency_ms": 18.3,
+      "top": [
+        "migrations/001_initial.sql:7-7",
+        "migrations/070_quoted.sql:1-1",
+        "migrations/001_initial.sql:8-8",
+        "migrations/075_schema.sql:1-1",
+        "migrations/020_shipments.sql:1-1"
+      ]
+    },
+    {
+      "id": "sql-kind-type",
+      "repo": "sql-chronology",
+      "category": "enumeration",
+      "need": "all",
+      "q": "what values can the processing_state enum have?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        2,
+        1
+      ],
+      "latency_ms": 19.6,
+      "top": [
+        "migrations/080_type.sql:1-1",
+        "migrations/001_initial.sql:9-9",
+        "migrations/001_initial.sql:10-10",
+        "migrations/090_table.sql:1-1",
+        "migrations/020_shipments.sql:1-1"
+      ]
+    },
+    {
+      "id": "sql-kind-table",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "does the processing_state table still exist?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 20.9,
+      "top": [
+        "migrations/001_initial.sql:10-10",
+        "migrations/090_table.sql:1-1",
+        "migrations/080_type.sql:1-1",
+        "migrations/001_initial.sql:9-9",
+        "migrations/001_initial.sql:5-5"
+      ]
+    },
+    {
+      "id": "sql-path-order",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "what is the newest migration changing lexical_order?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 18.9,
+      "top": [
+        "migrations/001_initial.sql:11-11",
+        "migrations/9_patch.sql:1-1",
+        "migrations/10_patch.sql:1-1",
+        "migrations/001_initial.sql:10-10",
+        "migrations/090_table.sql:1-1"
+      ]
+    },
+    {
+      "id": "sql-quoted-case",
+      "repo": "sql-chronology",
+      "category": "schema",
+      "need": "all",
+      "q": "where is quoted_case_reason added to app.\"Device_State\"?",
+      "rank": 2,
+      "unscoped": false,
+      "gold_ranks": [
+        1,
+        2
+      ],
+      "latency_ms": 21.3,
+      "top": [
+        "migrations/001_initial.sql:12-12",
+        "migrations/055_quoted_case.sql:1-1",
+        "migrations/001_initial.sql:5-5",
+        "migrations/050_devices.sql:1-1",
+        "migrations/001_initial.sql:3-3"
+      ]
+    }
+  ]
+}

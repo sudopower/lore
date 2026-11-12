@@ -93,8 +93,8 @@ cargo test --test sql_chronology measure_sql_history_scaling -- --ignored --noca
 paths. The fixture keeps document IDs short without shortening metadata paths, so this
 measures valid store/search inputs independently of existing Git/checkout/ID ingestion
 limits. It records model load and ingestion separately, then first-call, steady median
-and worst HTTP-handler latency. It checks that the newest migration is first and the
-original remains evidence. The model must already be cached. This is a local scaling
+and worst HTTP-handler latency. It checks that its ordinary `ADD COLUMN` companion follows
+the original definition and remains evidence. The model must already be cached. This is a local scaling
 observation, not a production latency bound.
 
 ## Agent comparison
