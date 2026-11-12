@@ -76,6 +76,105 @@ const CREATE: &str = "CREATE TABLE Accounts (status text CHECK (status IN ('pend
 const ALTER: &str = "ALTER TABLE public.accounts DROP CONSTRAINT accounts_status_check;\nALTER TABLE public.accounts ADD CONSTRAINT accounts_status_check CHECK (status IN ('pending', 'active', 'locked', 'closed', 'trial', 'paused', 'archived'));";
 
 #[sqlx::test(migrations = "./migrations")]
+async fn arbitrary_value_mutations_precede_definitions_but_unrelated_columns_follow(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let router = test_router(state.clone());
+    for case in ["enum", "check", "column"] {
+        let name = format!("obj_{}", Uuid::new_v4().simple());
+        let (tenant, _) = create_tenant_key(&router, &format!("values-{case}"), &["read"]).await;
+        let (create, alter) = match case {
+            "enum" => (
+                format!("CREATE TYPE {name} AS ENUM ('saffron', 'cobalt');"),
+                format!("ALTER TYPE {name} ADD VALUE 'amber';"),
+            ),
+            "check" => (
+                format!(
+                    "CREATE TABLE {name} (state text CONSTRAINT old CHECK (state IN ('saffron', 'cobalt')));"
+                ),
+                format!(
+                    "ALTER TABLE {name} DROP CONSTRAINT old, ADD CONSTRAINT fresh CHECK (state IN ('saffron', 'cobalt', 'amber'));"
+                ),
+            ),
+            _ => (
+                format!("CREATE TABLE {name} (state text CHECK (state IN ('saffron', 'cobalt')));"),
+                format!(
+                    "ALTER TABLE {name} ADD COLUMN body text DEFAULT 'CHECK (state IN (1,2))';"
+                ),
+            ),
+        };
+        sql(&state, tenant, "app", "001.sql", &create).await;
+        sql(&state, tenant, "app", "002.sql", &alter).await;
+        let hits = find(&state, tenant, "saffron cobalt", 5).await;
+        assert_eq!(hits.len(), 2);
+        let old = hits
+            .iter()
+            .position(|h| h.path.as_deref() == Some("001.sql"))
+            .unwrap();
+        let new = hits
+            .iter()
+            .position(|h| h.path.as_deref() == Some("002.sql"))
+            .unwrap();
+        assert_eq!(new < old, case != "column", "{case}: {hits:?}");
+        assert_eq!(hits[old].later_changes, ["app:002.sql"]);
+        let values: bool = sqlx::query_scalar(
+            "SELECT l.changes_values FROM sql_subject_lookup l JOIN documents d ON d.tenant_id = l.tenant_id AND d.source_id = l.source_id AND d.metadata->>'path' = l.path WHERE l.tenant_id = $1 AND l.path = '002.sql'",
+        ).bind(tenant).fetch_one(&state.pool).await.unwrap();
+        assert_eq!(values, case != "column");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn one_line_multiobject_change_flags_only_the_actual_check_owner(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let router = test_router(state.clone());
+    let (tenant, _) = create_tenant_key(&router, "mixed-owner", &["read"]).await;
+    let a = format!("a_{}", Uuid::new_v4().simple());
+    let b = format!("b_{}", Uuid::new_v4().simple());
+    sql(
+        &state,
+        tenant,
+        "app",
+        "001_a.sql",
+        &format!("CREATE TABLE {a} (state text CHECK (state IN ('saffron', 'cobalt')));"),
+    )
+    .await;
+    sql(
+        &state,
+        tenant,
+        "app",
+        "001_b.sql",
+        &format!("CREATE TABLE {b} (state text CHECK (state IN ('ivory', 'ochre')));"),
+    )
+    .await;
+    sql(&state, tenant, "app", "002.sql", &format!("ALTER TABLE {a} ADD COLUMN body text DEFAULT 'CHECK (x IN (1,2))'; ALTER TABLE {b} ADD CONSTRAINT c CHECK (state IN ('ivory', 'ochre', 'amber'));")).await;
+    for (q, parent, before) in [
+        ("saffron cobalt", "001_a.sql", false),
+        ("ivory ochre", "001_b.sql", true),
+    ] {
+        let hits = find(&state, tenant, q, 5).await;
+        let old = hits
+            .iter()
+            .position(|h| h.path.as_deref() == Some(parent))
+            .unwrap();
+        let new = hits
+            .iter()
+            .position(|h| h.path.as_deref() == Some("002.sql"))
+            .unwrap();
+        assert_eq!(new < old, before, "{q}: {hits:?}");
+        assert_eq!(hits[old].later_changes, ["app:002.sql"]);
+    }
+    let flags: Vec<(String, bool)> = sqlx::query_as("SELECT identity, changes_values FROM sql_subject_lookup WHERE tenant_id = $1 AND path = '002.sql' ORDER BY identity")
+        .bind(tenant).fetch_all(&state.pool).await.unwrap();
+    assert_eq!(
+        flags,
+        [
+            (format!("table:\"public\".\"{a}\""), false),
+            (format!("table:\"public\".\"{b}\""), true)
+        ]
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn current_values_search_and_both_answer_modes_include_the_change(pool: PgPool) {
     let mut state = test_state(pool, &std::env::temp_dir());
     // Capture the real fast-mode prompt while retaining the deterministic local fake model.
@@ -194,12 +293,6 @@ async fn cross_source_duplicates_do_not_erase_repeated_migration_positions(pool:
             assert!(
                 hits[..old]
                     .iter()
-                    .any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql")),
-                "{k}: {hits:?}"
-            );
-            assert!(
-                hits[..old]
-                    .iter()
                     .any(|h| h.source == "b" && h.path.as_deref() == Some("003.sql")),
                 "{k}: {hits:?}"
             );
@@ -285,12 +378,17 @@ async fn newest_uses_path_not_ingest_time_or_numeric_sort_and_deleted_files_disa
     sql(&state, tenant, "app", "migrations/10_alter.sql", ALTER).await;
     sql(&state, tenant, "app", "migrations/01_create.sql", CREATE).await;
     let hits = find(&state, tenant, "account statuses", 5).await;
-    assert_eq!(
-        hits[0].path.as_deref(),
-        Some("migrations/9_drop.sql"),
+    let latest = hits
+        .iter()
+        .find(|h| h.path.as_deref() == Some("migrations/9_drop.sql"))
+        .unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.path.as_deref() == Some("migrations/01_create.sql")
+                && h.later_changes == ["app:migrations/9_drop.sql"]),
         "{hits:?}"
     );
-    let id = hits[0].document_id;
+    let id = latest.document_id;
     sqlx::query("DELETE FROM documents WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
@@ -383,7 +481,7 @@ async fn enum_alter_multi_object_drop_and_case_folded_names_are_followed(pool: P
         hits.iter()
             .position(|h| h.text.contains("DROP TABLE"))
             .unwrap()
-            < hits
+            > hits
                 .iter()
                 .position(|h| h.text.contains("CREATE TABLE"))
                 .unwrap()
@@ -540,10 +638,11 @@ async fn long_identity_and_path_boundaries_keep_chronology_complete(pool: PgPool
             let hits = find(&state, tenant, "what are the current state values?", 5).await;
             assert_eq!(hits.len(), 2, "{identity_bytes}/{path_bytes}: {hits:?}");
             assert!(
-                hits[0].text.contains("latest_marker"),
+                hits[1].text.contains("latest_marker"),
                 "{identity_bytes}/{path_bytes}"
             );
-            assert_eq!(hits[1].later_changes, [format!("app:{latest}")]);
+            assert_eq!(hits[0].path.as_deref(), Some("000.sql"));
+            assert_eq!(hits[0].later_changes, [format!("app:{latest}")]);
             sqlx::query("DELETE FROM tenants WHERE id = $1")
                 .bind(tenant)
                 .execute(&state.pool)
@@ -581,8 +680,8 @@ async fn subjects_after_sixty_four_and_hash_collisions_do_not_lose_or_mislink_ch
         )
         .await;
         let hits = find(&state, tenant, "what state columns are there?", 5).await;
-        assert_eq!(hits[0].path.as_deref(), Some("002.sql"));
-        assert_eq!(hits[1].later_changes, ["app:002.sql"]);
+        assert!(hits.iter().any(|h| h.path.as_deref() == Some("002.sql")));
+        assert!(hits.iter().any(|h| h.later_changes == ["app:002.sql"]));
     }
     let (tenant, _) = create_tenant_key(&router, "collisions", &["read"]).await;
     sql(&state, tenant, "app", "001.sql", CREATE).await;
@@ -721,7 +820,10 @@ async fn newest_compares_normal_and_overflow_paths_and_last_chunk_in_a_file(pool
     sql(&state, tenant, "app", &overflow, ALTER).await;
     sql(&state, tenant, "app", "z.sql", "ALTER TABLE accounts ADD COLUMN x int;\nCREATE TABLE unrelated (id int);\nDROP TABLE accounts;").await;
     let hits = find(&state, tenant, "account statuses", 5).await;
-    assert!(hits[0].text.contains("DROP TABLE accounts"), "{hits:?}");
+    assert!(
+        hits.iter().any(|h| h.text.contains("DROP TABLE accounts")),
+        "{hits:?}"
+    );
     let original = hits
         .iter()
         .find(|h| h.path.as_deref() == Some("a.sql"))
@@ -808,13 +910,8 @@ async fn measure_sql_history_scaling(pool: PgPool) {
         timings.push(start.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(status, StatusCode::OK, "{body}");
         let hits = body["hits"].as_array().unwrap();
-        assert_eq!(hits[0]["title"], latest, "{body}");
-        assert!(
-            hits.iter()
-                .position(|h| h["title"] == "migrations/000000_create.sql")
-                .unwrap()
-                > 0
-        );
+        assert_eq!(hits[0]["title"], "migrations/000000_create.sql", "{body}");
+        assert_eq!(hits[1]["title"], latest, "{body}");
     }
     let mut steady = timings[1..].to_vec();
     steady.sort_by(f64::total_cmp);

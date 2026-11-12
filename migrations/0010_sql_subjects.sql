@@ -10,7 +10,8 @@ CREATE TABLE sql_subject_lookup (
     identity text COLLATE "C" NOT NULL,
     identity_hash bytea NOT NULL CHECK (octet_length(identity_hash) = 32),
     path text COLLATE "C" NOT NULL,
-    ord int NOT NULL
+    ord int NOT NULL,
+    changes_values boolean NOT NULL DEFAULT false
 );
 CREATE INDEX sql_subject_chunk ON sql_subject_lookup (chunk_id);
 -- Hashing the identity keeps keys small even for long quoted names. Queries also compare the

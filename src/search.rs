@@ -519,11 +519,13 @@ struct SqlChange {
     origin: i64,
     id: i64,
     path: String,
+    changes_values: bool,
 }
 
 type SqlExpansion = (Vec<(i64, f64)>, HashMap<i64, Vec<String>>);
 
-/// Add the newest migration for each retrieved SQL subject, before the older evidence. The
+/// Add the newest migration for each retrieved SQL subject. Allowed-value mutations precede
+/// older evidence; other companions follow their parent without demoting an earlier hit. The
 /// source id, tenant and kind remain fixed. Paths use bytewise ordering, not locale, timestamps,
 /// natural-number ordering or ingestion order. Each subject contributes at most one companion.
 async fn sql_changes(
@@ -534,14 +536,15 @@ async fn sql_changes(
 ) -> Result<SqlExpansion, AppError> {
     let ids: Vec<i64> = origins.values().flatten().copied().collect();
     let mut changes: Vec<SqlChange> = sqlx::query_as(
-        "SELECT base.id AS origin, latest.id, s.name || ':' || latest.path AS path
+        "SELECT base.id AS origin, latest.id, s.name || ':' || latest.path AS path,
+                latest.changes_values
          FROM chunks base
          JOIN documents original ON original.id = base.document_id
          JOIN sources s ON s.id = original.source_id
          JOIN sql_subject_lookup original_subject ON original_subject.chunk_id = base.id
          CROSS JOIN LATERAL (
-             SELECT candidate.id, candidate.path FROM (
-                 (SELECT entry.chunk_id AS id, entry.path, entry.ord
+             SELECT candidate.id, candidate.path, candidate.changes_values FROM (
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord, entry.changes_values
                   FROM sql_subject_lookup entry
                   WHERE entry.tenant_id = $2
                     AND entry.source_id = original.source_id AND entry.kind = original.kind
@@ -552,7 +555,7 @@ async fn sql_changes(
                   ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
                   LIMIT 1)
                  UNION ALL
-                 (SELECT entry.chunk_id AS id, entry.path, entry.ord
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord, entry.changes_values
                   FROM sql_subject_lookup entry
                   WHERE entry.tenant_id = $2
                     AND entry.source_id = original.source_id AND entry.kind = original.kind
@@ -605,8 +608,8 @@ fn promote_sql(fused: Vec<(i64, f64)>, changes: &[SqlChange], k: usize) -> SqlEx
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (id, score) in fused {
-        // A companion can itself be an older retrieved hit (a grouped chunk may name several
-        // subjects). Expand its known changes first too, so promoting it cannot reverse time.
+        // Expand value changes first, then the original, then ordinary companions. A newer
+        // hit already emitted at its own better rank keeps that earlier position.
         let mut stack = vec![(id, false)];
         while let Some((id, expanded)) = stack.pop() {
             if seen.contains(&id) {
@@ -618,10 +621,25 @@ fn promote_sql(fused: Vec<(i64, f64)>, changes: &[SqlChange], k: usize) -> SqlEx
                 if out.len() == k {
                     return (out, annotations);
                 }
+                if let Some(changes) = by_origin.get(&id) {
+                    stack.extend(
+                        changes
+                            .iter()
+                            .rev()
+                            .filter(|change| !change.changes_values)
+                            .map(|change| (change.id, false)),
+                    );
+                }
             } else {
                 stack.push((id, true));
                 if let Some(changes) = by_origin.get(&id) {
-                    stack.extend(changes.iter().rev().map(|change| (change.id, false)));
+                    stack.extend(
+                        changes
+                            .iter()
+                            .rev()
+                            .filter(|change| change.changes_values)
+                            .map(|change| (change.id, false)),
+                    );
                 }
             }
         }
@@ -905,11 +923,13 @@ mod tests {
                 origin: 1,
                 id: 2,
                 path: "002.sql".into(),
+                changes_values: true,
             },
             SqlChange {
                 origin: 2,
                 id: 3,
                 path: "003.sql".into(),
+                changes_values: true,
             },
         ];
         let fused = vec![(1, 0.03), (2, 0.02), (3, 0.01), (4, 0.005)];
@@ -921,6 +941,26 @@ mod tests {
         assert_eq!(notes[&1], ["002.sql"]);
         assert_eq!(notes[&2], ["003.sql"]);
         assert_eq!(promote_sql(fused, &changes, 1).0, [(3, 0.03)]);
+    }
+
+    #[test]
+    fn ordinary_companions_follow_their_parent_without_reordering_other_hits() {
+        let change = SqlChange {
+            origin: 2,
+            id: 4,
+            path: "app:002.sql".into(),
+            changes_values: false,
+        };
+        let fused = vec![(1, 0.05), (2, 0.04), (3, 0.03), (4, 0.02), (5, 0.01)];
+        let ids = |hits: Vec<(i64, f64)>| hits.into_iter().map(|h| h.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(promote_sql(fused, std::slice::from_ref(&change), 50).0),
+            [1, 2, 4, 3, 5]
+        );
+        assert_eq!(
+            ids(promote_sql(vec![(4, 0.05), (1, 0.04), (2, 0.03)], &[change], 50).0),
+            [4, 1, 2]
+        );
     }
 
     #[test]

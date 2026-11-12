@@ -70,6 +70,7 @@ struct Group {
     /// Some statement of the group lists values: seed rows, an enum type, a `CHECK ... IN`.
     enumerates: bool,
     identities: Vec<String>,
+    value_changes: Vec<String>,
 }
 
 impl Group {
@@ -80,6 +81,7 @@ impl Group {
             keys: Vec::new(),
             enumerates: false,
             identities: Vec::new(),
+            value_changes: Vec::new(),
         };
         g.add(about, span);
         g
@@ -103,6 +105,9 @@ impl Group {
         self.span.end = self.span.end.max(span.end);
         self.enumerates |= about.enumerates;
         for identity in about.identities {
+            if about.changes_values && !self.value_changes.contains(&identity) {
+                self.value_changes.push(identity.clone());
+            }
             if !self.identities.contains(&identity) {
                 self.identities.push(identity);
             }
@@ -154,6 +159,7 @@ impl Group {
         Chunk {
             sql_subjects: self.identities.iter().map(|s| s.to_lowercase()).collect(),
             sql_identities: self.identities.clone(),
+            sql_value_changes: self.value_changes.clone(),
             ..c.enumerating(self.enumerates)
         }
     }
@@ -316,6 +322,7 @@ struct About {
     enumerates: bool,
     /// Canonical object identities, preserving the case of quoted components.
     identities: Vec<String>,
+    changes_values: bool,
 }
 
 impl About {
@@ -327,6 +334,7 @@ impl About {
             keys: Vec::new(),
             enumerates: false,
             identities: Vec::new(),
+            changes_values: false,
         }
     }
 }
@@ -366,10 +374,12 @@ fn about(code: &str) -> About {
     let mut about = match verb.to_ascii_uppercase().as_str() {
         "CREATE" => create(&mut p),
         "ALTER" => {
-            p.kind();
+            let kind = p.kind();
             p.eat(&["IF", "EXISTS"]);
             p.eat(&["ONLY"]);
-            About::of(p.name().into_iter().collect(), None)
+            let mut about = About::of(p.name().into_iter().collect(), None);
+            about.changes_values = changes_allowed_values(&kind, &mut p);
+            about
         }
         "DROP" => drop(&mut p),
         "INSERT" => insert(&mut p),
@@ -438,6 +448,74 @@ fn about(code: &str) -> About {
         }
     }
     about
+}
+
+/// Only structural ALTER forms that change allowed values. The splitter has removed
+/// comments; strings and quoted identifiers are not keyword tokens. Each statement has one
+/// canonical owner, so grouping multiple objects cannot transfer this flag between them.
+fn changes_allowed_values(kind: &str, p: &mut Cursor<'_>) -> bool {
+    if kind.eq_ignore_ascii_case("TYPE") {
+        if p.eat(&["ADD", "VALUE"]) {
+            p.eat(&["IF", "NOT", "EXISTS"]);
+            return matches!(p.rest().first(), Some(Token::Str(_)));
+        }
+        if p.eat(&["RENAME", "VALUE"]) && matches!(p.rest().first(), Some(Token::Str(_))) {
+            p.i += 1;
+            return p.eat(&["TO"]) && matches!(p.rest().first(), Some(Token::Str(_)));
+        }
+        return false;
+    }
+    if !kind.eq_ignore_ascii_case("TABLE") {
+        return false;
+    }
+    // Split only at top-level action commas. A CHECK inside a column DEFAULT/function or
+    // another nested expression is not a table-level ADD CHECK action.
+    let tokens = p.rest();
+    let mut actions = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            Token::Punct(',') if depth == 0 => {
+                actions.push(&tokens[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    actions.push(&tokens[start..]);
+    actions.into_iter().any(|tokens| {
+        let mut action = Cursor {
+            tokens,
+            i: 0,
+            names: Vec::new(),
+        };
+        if !action.eat(&["ADD"]) {
+            return false;
+        }
+        if action.eat(&["CONSTRAINT"]) {
+            if !matches!(
+                action.rest().first(),
+                Some(Token::Word(_) | Token::Quoted(_))
+            ) {
+                return false;
+            }
+            action.i += 1;
+        }
+        action.eat(&["CHECK"])
+            && action.punct('(')
+            && !matches!(action.rest().first(), None | Some(Token::Punct(')')))
+    })
 }
 
 /// Include the kind to avoid linking a table and a type with the same spelling. Indexes,
@@ -898,6 +976,55 @@ CREATE TABLE IF NOT EXISTS public.seats (
 );
 ALTER TABLE ONLY public.seats ADD COLUMN email text;
 ";
+
+    #[test]
+    fn value_mutations_use_structural_tokens_and_their_own_canonical_subject() {
+        for code in [
+            "ALTER TYPE app.\"Signal\" ADD VALUE IF NOT EXISTS 'amber';",
+            "ALTER TYPE app.\"Signal\" RENAME VALUE 'amber' TO 'green';",
+            "ALTER TABLE app.\"Signal\" ADD CHECK (state IN ('amber', 'green'));",
+            "ALTER TABLE app.\"Signal\" DROP CONSTRAINT old, ADD CONSTRAINT \"CHECK\" CHECK ((state IN ('amber', 'green'))) NOT VALID;",
+            "ALTER /* CHECK belongs to a comment */ TABLE app.\"Signal\" ADD CONSTRAINT c CHECK (state > 0);",
+        ] {
+            let chunk = chunk_file("m.sql", code).remove(0);
+            assert_eq!(chunk.sql_value_changes, chunk.sql_identities, "{code}");
+        }
+        for code in [
+            "ALTER TABLE t ADD COLUMN body text;",
+            "ALTER TABLE t ADD COLUMN body text DEFAULT 'ADD CHECK (state IN (1,2))';",
+            "ALTER TABLE t ADD COLUMN body text DEFAULT $$ADD CHECK (state IN (1,2))$$;",
+            "ALTER TABLE t ADD COLUMN body text; -- ADD CHECK (state IN (1,2))",
+            "ALTER TABLE t ADD COLUMN \"CHECK\" text;",
+            "ALTER TABLE t ADD COLUMN x text CHECK (x IN ('a', 'b'));",
+            "ALTER TABLE t ADD CONSTRAINT c UNIQUE (state);",
+            "ALTER TABLE t DROP CONSTRAINT state_check;",
+            "ALTER TABLE t ADD CHECK (state IN ('a', 'b');",
+            "ALTER TYPE t ADD ATTRIBUTE value text;",
+            "COMMENT ON TABLE t IS 'ALTER TYPE t ADD VALUE ''x''';",
+            "ALTER TYPE t ADD \"VALUE\" 'x';",
+        ] {
+            assert!(
+                chunk_file("m.sql", code)
+                    .iter()
+                    .all(|c| c.sql_value_changes.is_empty()),
+                "{code}"
+            );
+        }
+        let chunks = chunk_file(
+            "m.sql",
+            "ALTER TABLE app.\"Mixed\" ADD COLUMN body text DEFAULT 'CHECK (x IN (1,2))'; ALTER TABLE app.mixed ADD CHECK (x IN (1,2));",
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sql_identities.len(), 2);
+        assert_eq!(chunks[0].sql_value_changes, ["table:\"app\".\"mixed\""]);
+        let long = format!(
+            "ALTER TABLE t DROP CONSTRAINT \"{}\", ADD CHECK (state IN (1,2));",
+            "x".repeat(8500)
+        );
+        let chunks = chunk_file("m.sql", &long);
+        assert!(!chunks[0].text.contains("ADD CHECK"));
+        assert_eq!(chunks[0].sql_value_changes, ["table:\"public\".\"t\""]);
+    }
 
     #[test]
     fn a_table_and_its_indexes_share_a_chunk() {

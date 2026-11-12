@@ -434,8 +434,9 @@ async fn insert_chunk(
                    || setweight(to_tsvector('english', $9::text), 'B'),
                  $10, $11, $12, $13, $14, $15, $16)
          RETURNING id)
-         INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, identity_hash, path, ord)
-         SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, subjects.identity_hash, d.metadata->>'path', $3
+         INSERT INTO sql_subject_lookup (chunk_id, tenant_id, source_id, kind, subject, identity, identity_hash, path, ord, changes_values)
+         SELECT added.id, $1, d.source_id, d.kind, subjects.subject, subjects.identity, subjects.identity_hash, d.metadata->>'path', $3,
+                subjects.identity = ANY($19::text[])
          FROM added
          JOIN documents d ON d.id = $2
          CROSS JOIN unnest($16::text[], $17::text[], $18::bytea[]) AS subjects(subject, identity, identity_hash)
@@ -459,6 +460,7 @@ async fn insert_chunk(
     .bind(&c.chunk.sql_subjects)
     .bind(&c.chunk.sql_identities)
     .bind(&identity_hashes)
+    .bind(&c.chunk.sql_value_changes)
     .execute(conn)
     .await?;
     Ok(())

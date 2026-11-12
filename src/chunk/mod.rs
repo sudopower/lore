@@ -52,6 +52,8 @@ pub struct Chunk {
     pub sql_subjects: Vec<String>,
     /// Parallel canonical identities preserve quoted case for SQL object matching.
     pub sql_identities: Vec<String>,
+    /// Canonical subjects whose allowed values an ALTER statement changes.
+    pub sql_value_changes: Vec<String>,
     /// Test, fixture, mock or snapshot file.
     pub is_test: bool,
     /// Generated path, filename, or file-level DO NOT EDIT header.
@@ -85,6 +87,7 @@ impl Chunk {
             enumerates: false,
             sql_subjects: Vec::new(),
             sql_identities: Vec::new(),
+            sql_value_changes: Vec::new(),
             is_test: false,
             is_generated: false,
             defines: Vec::new(),
