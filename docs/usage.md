@@ -43,6 +43,31 @@ curl -X PUT "localhost:8080/v1/repos/<id>/bundle?ref=$(git rev-parse HEAD)&full=
 
 `ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted` and `chunks`.
 
+Repo indexing publishes atomically. While a push runs, search sees the previous complete index
+(or no repo chunks on its first push). Changed, new and deleted files and `indexed_commit`
+become visible together after success. A failed or cancelled push leaves the previous index
+visible. Unchanged files keep their existing chunks and embeddings.
+
+Each search uses one database snapshot for lexical ranking, vector ranking, symbol/call-graph
+expansion and returned text, even if a push finishes between those steps. Stored document reads
+likewise keep metadata and chunks on one snapshot. Separate requests can observe different
+completed pushes. This does
+not pin deep-mode or MCP `grep` and `read_file`: those tools read the live checkout, which may
+already contain the incoming commit while indexing is still running or after a failed push.
+Standalone MCP `definition` and `callers` lookups are not covered by this search snapshot guarantee.
+
+The atomic write uses one database transaction and connection for the duration of indexing,
+including embedding. It does not buffer repo text or copy unchanged chunks. With the embedding
+cache enabled, it stages each fresh vector and its exact cache key until commit: a 384-float
+vector takes 1,536 bytes of payload, plus keys, allocation and publication overhead. This memory
+grows with newly embedded chunks, and concurrent cold pushes add their staging requirements.
+Only after commit releases the connection are cache entries published in sorted, short inserts;
+a cache error is logged but does not fail an already-published index. Failed or cancelled pushes
+discard their staging. Standalone documents use the same best-effort post-commit cache policy.
+A large update also retains old row versions until publication and until older readers finish.
+Concurrent pushes to different sources each use a connection; when the pool is full, other
+requests wait for one. Pushes to the same source remain serialized.
+
 Symlinks, submodules, binary or non-UTF-8 files, files over 256 KiB, and lock files, build output and vendored directories are skipped and counted in `files_skipped`.
 
 ## Index a repo
@@ -128,9 +153,13 @@ The answer is `{"hits": [...]}`, best first. A hit has `chunk_id`, `document_id`
 
 The `web_url_template` of a repo source can use `{path}`, `{commit}`, `{start}` and `{end}`, for example `https://github.com/acme/app/blob/{commit}/{path}#L{start}-L{end}`. `{path}` is percent-encoded segment by segment (the `/` between segments stays), so a space, `#`, `?` or `%` in a file name cannot change the link. Other `{...}` text is left as it is.
 
-How it ranks: the query is run twice, once against the Postgres full-text index (any query word may match, ranked with `ts_rank_cd`) and once against the pgvector embeddings (cosine distance). Each run keeps its best 50 chunks. A third list holds the first 3 of the vector hits that define a list of values (enums, constant lists, SQL seed rows, `CHECK ... IN` lists), so "which X are there" finds the definition of X rather than only the code that uses it. The lists are merged with Reciprocal Rank Fusion: a chunk scores the sum of `1 / (60 + rank)` over the lists it is in, so the score is at most about 0.049 and is only good for comparing hits of one search. Ties go to the better full-text rank, then to the lower chunk id. A query with only stop words (`the and of`) has no full-text part and is answered from the vectors alone. Identifiers such as `MaxSeatsPerPlan` are also indexed as the words `max seats per plan`, so a search for "seats" finds them.
+How it ranks: the query runs against the Postgres full-text index (any query word may match, ranked with `ts_rank_cd`) and pgvector embeddings (cosine distance). Each keeps its best 50 chunks. A third list holds the first 3 vector hits defining lists of values (enums, constant lists, SQL seed rows, `CHECK ... IN` lists), so "which X are there" finds definitions rather than only uses. A fourth list holds up to 30 symbol definitions, their direct callers and their direct callees, in that order. It considers at most 8 exact identifiers (at least 3 characters, excluding stop words), skips names matching more than 5 definition chunks and omits ambiguous edges. Each symbol lookup keeps at most 50 candidate chunks; capped definition batches are skipped rather than guessed. All lists honor tenant, source and kind filters. The lists merge with Reciprocal Rank Fusion: a chunk scores the sum of `1 / (60 + rank)` over its lists, so the score is at most about 0.066 and only compares hits of one search. Ties go to better full-text rank, then lower chunk id. Stop-word-only queries (`the and of`) have no full-text or symbol part. Identifiers such as `MaxSeatsPerPlan` are also indexed as the words `max seats per plan`, so "seats" finds them.
+
+With a `source` filter, the vector list uses exact cosine ranking over chunks matching tenant, source and kinds, breaking equal distances by chunk id. Without a source filter it keeps the existing approximate HNSW path, including for kind-only filters. Exact scoped ranking can return nearer chunks that approximate search missed; it is not always faster for every source size.
 
 The CLI prints, for each hit, `path:start-end  (score 0.032)  symbols` (the title when there is no path), then the first 3 snippet lines indented by 4 spaces. `--json` prints the server's JSON on one line. No hits prints `no results` on stderr and exits 0.
+
+The symbol list activates for explicit identifiers (`snake_case`, mixed-case names, names with digits, qualified or backticked names), name-only queries, and call/definition/connection questions such as "how does checkout reach persist?". It does not treat every ordinary English word as a symbol. This keeps unrelated natural-language rankings unchanged. The two symbol GIN indexes use `fastupdate=off`: indexing pays the update cost directly so bulk pushes cannot build a pending list that slows lookups.
 
 ## Traces
 
@@ -267,5 +296,13 @@ The tools are written for agents. `search` runs no language model, answers in we
 | `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4321 in / 381 out, 4.9 s)` (deep mode adds the number of tool calls) |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
+| `definition` | `symbol` (exact name, optionally `module::name` or `Type::method`), optional `source` | Definition excerpts with paths, lines and document ids. Multiple matches are labeled ambiguous |
+| `callers` | `symbol`, optional `source` | Caller excerpts labeled `SameFile`, `Imported`, `Unique` or `Ambiguous`, with the number of possible definitions |
+
+Symbol lookups use the existing tree-sitter parse for Rust, Go, Python, JavaScript, TypeScript and TSX, with no compiler, language server or model. SQL objects have definitions but not call edges. After upgrading, run `lore repo push . --full` for each repository: chunker version 3 fills the new indexed `defines` and `calls` arrays; older rows remain searchable but have no call information.
+
+Calls resolve within their repository/source: same file first, then an explicit module/type or import, then a unique name. Imported aliases retain the original name. Qualifiers use the last module segment, not a full compiler-resolved import path. Duplicate modules, overloads and unknown receivers can remain ambiguous. Value-receiver methods are name-only; dynamic dispatch, callbacks, macro expansion, wildcard imports, re-exports and lexical shadowing are not resolved. Malformed files that fall back to line chunking have no call metadata.
+
+Each chunk holds at most 256 definitions and calls, with names at most 128 bytes. Lookups examine at most 100 definition chunks and 200 caller chunks, report truncation, and do not infer edges from a capped definition set. Filter `source` to narrow large indexes. Recursive calls within their own chunk are not returned as separate callers.
 
 `scripts/mcp_smoke.sh` runs the whole exchange against a server: `LORE_URL=http://localhost:8080 LORE_ADMIN_TOKEN=dev-admin scripts/mcp_smoke.sh` prints the sorted tool names, the `src/billing/plans.rs` hit and `MCP SMOKE OK`. By default `/mcp` accepts any `Host` header; set `LORE_MCP_ALLOWED_HOSTS` to restrict it.
