@@ -1,0 +1,35 @@
+{
+  "runtime": {
+    "version": "i33-ranking-a2eafaa",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "query": "which generated agent span constants are in the registry",
+  "primary_source": "registry",
+  "also_in": [
+    "sdk-browser",
+    "sdk-python"
+  ],
+  "identical_generated_passages": 1,
+  "returned_hit_fields": [
+    "also_in",
+    "chunk_id",
+    "document_id",
+    "end_line",
+    "external_id",
+    "kind",
+    "path",
+    "score",
+    "snippet",
+    "source",
+    "start_line",
+    "symbols",
+    "title",
+    "uri"
+  ]
+}

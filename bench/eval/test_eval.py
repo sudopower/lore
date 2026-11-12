@@ -269,7 +269,7 @@ class Run(unittest.TestCase):
         self.assertTrue(res["questions"][0]["unscoped"])
         self.assertTrue(all("source" not in p for p in FakeLore.seen))
         q["repo"] = "wrong-source"
-        self.assertIsNone(retrieval.question_rank(FakeLore.seen, q))
+        self.assertIsNone(retrieval.question_rank([hit("src/a.rs", 10, 30)], q))
 
     def test_multirepo_gold_ranges_exist_in_the_fixed_corpus(self):
         with open(os.path.join(HERE, "testdata", "multirepo.json")) as f:

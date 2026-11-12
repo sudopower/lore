@@ -275,11 +275,27 @@ async fn duplicate_text_collapses_before_k_with_scoped_provenance(pool: PgPool) 
         )],
     )
     .await;
+    add_doc(
+        &state,
+        tenant,
+        "doc-copy",
+        "constants",
+        "note",
+        "agent constants",
+        None,
+        vec![chunk(
+            "agent span constants session tool completion",
+            1,
+            1,
+            &[],
+        )],
+    )
+    .await;
     let found = hits(&router, &key, "agent span constants", "&k=3").await;
     assert_eq!(found.len(), 3, "fill k after collapsing duplicate copies");
     let duplicate = found
         .iter()
-        .find(|h| h["also_in"].as_array().unwrap().len() == 2)
+        .find(|h| h["also_in"].as_array().unwrap().len() == 3)
         .unwrap();
     let mut sources = duplicate["also_in"]
         .as_array()
@@ -289,7 +305,15 @@ async fn duplicate_text_collapses_before_k_with_scoped_provenance(pool: PgPool) 
         .collect::<Vec<_>>();
     sources.push(duplicate["source"].as_str().unwrap());
     sources.sort();
-    assert_eq!(sources, ["registry", "sdk-one", "sdk-two"]);
+    assert_eq!(sources, ["doc-copy", "registry", "sdk-one", "sdk-two"]);
+    let code_only = hits(&router, &key, "agent span constants", "&kind=code&k=50").await;
+    assert!(code_only.iter().all(|h| {
+        h["kind"] == "code"
+            && !h["also_in"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("doc-copy"))
+    }));
     let scoped = hits(
         &router,
         &key,
