@@ -40,6 +40,8 @@ fn chunk(text: &str, lines: (u32, u32), symbols: &[&str]) -> Chunk {
         enumerates: false,
         sql_subjects: Vec::new(),
         sql_identities: Vec::new(),
+        defines: Vec::new(),
+        calls: Vec::new(),
     }
 }
 

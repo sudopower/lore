@@ -6,6 +6,7 @@
 //! uses [`chunk_markdown_split`] instead, which splits rather than cuts so that all of the text
 //! stays searchable, and stops as soon as a chunk limit is passed.
 
+mod calls;
 mod code;
 mod lines;
 mod markdown;
@@ -51,6 +52,15 @@ pub struct Chunk {
     pub sql_subjects: Vec<String>,
     /// Parallel canonical identities preserve quoted case for SQL object matching.
     pub sql_identities: Vec<String>,
+    /// The functions, methods, types and SQL objects this chunk defines, as they are called: a
+    /// method also as `Type::method`. Each definition is on one chunk only, the smallest one
+    /// holding its first line.
+    pub defines: Vec<String>,
+    /// What the code in this chunk calls, by name. A call that names where its target lives, by a
+    /// path (`store::index_text`, `Plan::new`) or through an import, is stored as
+    /// `qualifier::name` and `::name`; any other call as the bare name. Nothing is resolved
+    /// here: `callgraph` ties calls to definitions when asked.
+    pub calls: Vec<String>,
 }
 
 impl Chunk {
@@ -71,6 +81,8 @@ impl Chunk {
             enumerates: false,
             sql_subjects: Vec::new(),
             sql_identities: Vec::new(),
+            defines: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -136,7 +148,20 @@ pub fn language_for(path: &str) -> Language {
 pub fn chunk_file(path: &str, content: &str) -> Vec<Chunk> {
     match language_for(path) {
         Language::Markdown => markdown::chunk_markdown(content, file_stem(path)),
-        Language::Sql => sql::chunk(content),
+        // The statement names of SQL chunks are the tables, views and functions they create.
+        Language::Sql => sql::chunk(content)
+            .into_iter()
+            .map(|c| Chunk {
+                defines: c
+                    .symbols
+                    .iter()
+                    .filter(|s| s.len() <= calls::MAX_NAME_BYTES)
+                    .take(calls::MAX_NAMES_PER_CHUNK)
+                    .cloned()
+                    .collect(),
+                ..c
+            })
+            .collect(),
         Language::Other => lines::chunk(content),
         lang => code::chunk(lang, content),
     }
