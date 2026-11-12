@@ -521,6 +521,8 @@ struct SqlChange {
     path: String,
 }
 
+type SqlExpansion = (Vec<(i64, f64)>, HashMap<i64, Vec<String>>);
+
 /// Add the newest migration for each retrieved SQL subject, before the older evidence. The
 /// source id, tenant and kind remain fixed. Paths use bytewise ordering, not locale, timestamps,
 /// natural-number ordering or ingestion order. Each subject contributes at most one companion.
@@ -529,7 +531,7 @@ async fn sql_changes(
     fused: Vec<(i64, f64)>,
     origins: &HashMap<i64, Vec<i64>>,
     f: &Filter<'_>,
-) -> Result<(Vec<(i64, f64)>, HashMap<i64, Vec<String>>), AppError> {
+) -> Result<SqlExpansion, AppError> {
     let ids: Vec<i64> = origins.values().flatten().copied().collect();
     let mut changes: Vec<SqlChange> = sqlx::query_as(
         "SELECT base.id AS origin, latest.id, s.name || ':' || latest.path AS path
@@ -590,11 +592,7 @@ async fn sql_changes(
     Ok(promote_sql(fused, &changes, usize::MAX))
 }
 
-fn promote_sql(
-    fused: Vec<(i64, f64)>,
-    changes: &[SqlChange],
-    k: usize,
-) -> (Vec<(i64, f64)>, HashMap<i64, Vec<String>>) {
+fn promote_sql(fused: Vec<(i64, f64)>, changes: &[SqlChange], k: usize) -> SqlExpansion {
     let mut by_origin: HashMap<i64, Vec<&SqlChange>> = HashMap::new();
     let mut annotations: HashMap<i64, Vec<String>> = HashMap::new();
     for change in changes {

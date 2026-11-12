@@ -744,3 +744,88 @@ async fn newest_compares_normal_and_overflow_paths_and_last_chunk_in_a_file(pool
     assert_eq!(original.later_changes, [format!("app:{overflow}")]);
     assert!(hits[0].text.contains("'archived'"));
 }
+
+/// Opt-in, fresh-process end-to-end measurement, including real query embeddings. Run one
+/// history size/path length per process; regular tests never download or load this model.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "manual real-fastembed SQL history scaling measurement"]
+async fn measure_sql_history_scaling(pool: PgPool) {
+    use std::time::Instant;
+    let rows: usize = std::env::var("LORE_SQL_PERF_ROWS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let bytes: usize = std::env::var("LORE_SQL_PERF_PATH_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cache = std::env::var("LORE_SQL_PERF_MODEL_DIR").unwrap();
+    let mut state = test_state(pool, &std::env::temp_dir());
+    let start = Instant::now();
+    state.embedder =
+        std::sync::Arc::new(lore::embed::FastEmbedder::new(std::path::Path::new(&cache)).unwrap());
+    let model_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let router = test_router(state.clone());
+    let (tenant, key) = create_tenant_key(&router, "sql-scale", &["read"]).await;
+    let start = Instant::now();
+    sql(
+        &state,
+        tenant,
+        "app",
+        "migrations/000000_create.sql",
+        CREATE,
+    )
+    .await;
+    let mut latest = String::new();
+    for n in 1..=rows {
+        let prefix = format!("migrations/{n:06}_");
+        latest = if bytes == 0 {
+            format!("{prefix}change.sql")
+        } else {
+            format!("{prefix}{}.sql", random_ascii(bytes - prefix.len() - 4))
+        };
+        sql(
+            &state,
+            tenant,
+            "app",
+            &latest,
+            "ALTER TABLE accounts ADD COLUMN latest_marker int;",
+        )
+        .await;
+    }
+    let ingest_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let mut timings = Vec::new();
+    for _ in 0..8 {
+        let start = Instant::now();
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/v1/search?q=pending%20active%20locked%20closed%20trial%20paused&source=app&k=5",
+            &key,
+            Vec::new(),
+        )
+        .await;
+        timings.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let hits = body["hits"].as_array().unwrap();
+        assert_eq!(hits[0]["title"], latest, "{body}");
+        assert!(
+            hits.iter()
+                .position(|h| h["title"] == "migrations/000000_create.sql")
+                .unwrap()
+                > 0
+        );
+    }
+    let mut steady = timings[1..].to_vec();
+    steady.sort_by(f64::total_cmp);
+    println!(
+        "{}",
+        json!({
+            "rows": rows, "path_bytes": bytes, "embedder": state.embedder.name(),
+            "model_load_ms": model_ms, "ingest_ms": ingest_ms, "first_ms": timings[0],
+            "steady_median_ms": steady[steady.len() / 2],
+            "worst_ms": timings.iter().copied().fold(0.0_f64, f64::max),
+            "all_ms": timings,
+        })
+    );
+}
