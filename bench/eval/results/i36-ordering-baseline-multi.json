@@ -1,0 +1,380 @@
+{
+  "label": "i36-ordering-baseline-multi",
+  "date": "2026-11-12T21:39:11+00:00",
+  "url": "http://127.0.0.1:8096",
+  "k": 50,
+  "server": {
+    "version": "0.1.0",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "sets": [
+    {
+      "file": ".claude/worktrees/i36-sql-latest/bench/eval/questions/multirepo.json",
+      "commits": {},
+      "questions": 15
+    }
+  ],
+  "latency_ms_median": 35.5,
+  "latency_ms_first": 47.7,
+  "latency_ms_max": 47.7,
+  "summary": {
+    "overall": {
+      "n": 15,
+      "hit@5": 15,
+      "hit@12": 15,
+      "hit@50": 15,
+      "mrr": 0.839
+    },
+    "categories": {
+      "enumeration": {
+        "n": 2,
+        "hit@5": 2,
+        "hit@12": 2,
+        "hit@50": 2,
+        "mrr": 0.625
+      },
+      "where": {
+        "n": 4,
+        "hit@5": 4,
+        "hit@12": 4,
+        "hit@50": 4,
+        "mrr": 1.0
+      },
+      "config": {
+        "n": 4,
+        "hit@5": 4,
+        "hit@12": 4,
+        "hit@50": 4,
+        "mrr": 0.833
+      },
+      "how": {
+        "n": 5,
+        "hit@5": 5,
+        "hit@12": 5,
+        "hit@50": 5,
+        "mrr": 0.8
+      }
+    }
+  },
+  "questions": [
+    {
+      "id": "multi-01",
+      "repo": "platform",
+      "category": "config",
+      "need": "any",
+      "q": "helm values for the receiver",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        11,
+        1
+      ],
+      "latency_ms": 35.5,
+      "top": [
+        "charts/receiver/templates/configmap.yaml:1-9",
+        "src/chunk/code.rs:289-326",
+        "README.md:12-13",
+        "src/chunk/sql.rs:484-515",
+        "fixtures/receiver.jsonl:1-2"
+      ]
+    },
+    {
+      "id": "multi-02",
+      "repo": "platform",
+      "category": "where",
+      "need": "any",
+      "q": "where is the receiver queue capacity configured in helm",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 34.9,
+      "top": [
+        "charts/receiver/templates/configmap.yaml:1-9",
+        "README.md:12-13",
+        "README.md:6-7",
+        "charts/receiver/values.yaml:1-4",
+        "migrations/001_initial.sql:2-2"
+      ]
+    },
+    {
+      "id": "multi-03",
+      "repo": "platform",
+      "category": "config",
+      "need": "any",
+      "q": "receiver batch size default configuration",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        16,
+        1
+      ],
+      "latency_ms": 33.4,
+      "top": [
+        "charts/receiver/templates/configmap.yaml:1-9",
+        "src/embed/fastembed.rs:9-9",
+        "docs/configuration.md:1-34",
+        "src/config.rs:92-93",
+        "README.md:6-7"
+      ]
+    },
+    {
+      "id": "multi-04",
+      "repo": "coding-plugin",
+      "category": "enumeration",
+      "need": "any",
+      "q": "which spans does the coding-agent plugin send",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 36.9,
+      "top": [
+        "src/telemetry.py:1-4",
+        "src/sessions.rs:394-530",
+        "docs/usage.md:105-116",
+        "src/sessions.rs:749-767",
+        "src/sessions.rs:902-923"
+      ]
+    },
+    {
+      "id": "multi-05",
+      "repo": "coding-plugin",
+      "category": "how",
+      "need": "any",
+      "q": "how does the coding-agent plugin attach session and model attributes",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 44.0,
+      "top": [
+        "src/attributes.py:1-4",
+        "docs/usage.md:217-240",
+        "scripts/smoke.sh:101-160",
+        "src/sessions.rs:394-530",
+        "docs/architecture.md:5-41"
+      ]
+    },
+    {
+      "id": "multi-06",
+      "repo": "coding-plugin",
+      "category": "how",
+      "need": "any",
+      "q": "how does the coding-agent plugin mark error spans",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 42.0,
+      "top": [
+        "src/errors.py:1-4",
+        "src/sessions.rs:718-747",
+        "src/sessions.rs:394-530",
+        "src/telemetry.py:1-4",
+        "src/sessions.rs:749-767"
+      ]
+    },
+    {
+      "id": "multi-07",
+      "repo": "platform",
+      "category": "how",
+      "need": "any",
+      "q": "what limits apply to toolsets",
+      "rank": 2,
+      "unscoped": true,
+      "gold_ranks": [
+        2
+      ],
+      "latency_ms": 30.4,
+      "top": [
+        "README.md:3-4",
+        "src/toolsets.py:1-5",
+        "src/http/documents.rs:399-419",
+        "src/config.rs:272-285",
+        "src/http/repos.rs:98-108"
+      ]
+    },
+    {
+      "id": "multi-08",
+      "repo": "platform",
+      "category": "how",
+      "need": "any",
+      "q": "when does the receiver reject a payload because of its size limit",
+      "rank": 2,
+      "unscoped": true,
+      "gold_ranks": [
+        2
+      ],
+      "latency_ms": 37.6,
+      "top": [
+        "src/http/traces.rs:48-110",
+        "src/payload.py:1-5",
+        "README.md:6-7",
+        "src/http/documents.rs:421-438",
+        "src/http/documents.rs:399-419"
+      ]
+    },
+    {
+      "id": "multi-09",
+      "repo": "platform",
+      "category": "how",
+      "need": "any",
+      "q": "how does the receiver limit retry delays",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 32.3,
+      "top": [
+        "src/retries.py:1-3",
+        "src/llm/anthropic.rs:801-822",
+        "README.md:9-10",
+        "src/llm/anthropic.rs:306-316",
+        "README.md:6-7"
+      ]
+    },
+    {
+      "id": "multi-10",
+      "repo": "platform",
+      "category": "where",
+      "need": "any",
+      "q": "which test checks that oversized toolsets are rejected",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 35.9,
+      "top": [
+        "tests/test_toolsets.py:1-4",
+        "src/otlp/mod.rs:516-535",
+        "src/toolsets.py:1-5",
+        "src/otlp/mod.rs:682-692",
+        "src/http/documents.rs:461-471"
+      ]
+    },
+    {
+      "id": "multi-11",
+      "repo": "qa-exports",
+      "category": "where",
+      "need": "any",
+      "q": "where is the receiver configmap snapshot",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 29.6,
+      "top": [
+        "__snapshots__/receiver.yaml:1-5",
+        "fixtures/receiver.jsonl:1-2",
+        "charts/receiver/templates/configmap.yaml:1-9",
+        "testdata/receiver.yaml:1-5",
+        "tests/otlp.rs:306-326"
+      ]
+    },
+    {
+      "id": "multi-12",
+      "repo": "registry",
+      "category": "enumeration",
+      "need": "any",
+      "q": "which generated agent span constants are in the registry",
+      "rank": 4,
+      "unscoped": true,
+      "gold_ranks": [
+        4
+      ],
+      "latency_ms": 32.0,
+      "top": [
+        "src/sessions.rs:394-530",
+        "src/otlp/mod.rs:587-617",
+        "src/telemetry.py:1-4",
+        "gen/agent_generated.py:1-4",
+        "src/otlp/mod.rs:182-206"
+      ]
+    },
+    {
+      "id": "multi-13",
+      "repo": "platform",
+      "category": "config",
+      "need": "any",
+      "q": "README installation instructions for the receiver chart",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 31.0,
+      "top": [
+        "README.md:12-13",
+        "charts/receiver/templates/configmap.yaml:1-9",
+        "README.md:6-7",
+        "README.md:9-10",
+        "README.md:1-1"
+      ]
+    },
+    {
+      "id": "multi-14",
+      "repo": "coding-plugin",
+      "category": "config",
+      "need": "any",
+      "q": "documentation for inspecting plugin telemetry locally",
+      "rank": 3,
+      "unscoped": true,
+      "gold_ranks": [
+        3
+      ],
+      "latency_ms": 35.5,
+      "top": [
+        "src/mcp.rs:168-263",
+        "src/embed/fastembed.rs:86-152",
+        "docs/telemetry.md:1-2",
+        "tests/fixture.rs:5-13",
+        "docs/usage.md:118-142"
+      ]
+    },
+    {
+      "id": "multi-15",
+      "repo": "platform",
+      "category": "where",
+      "need": "any",
+      "q": "which test rejects receiver payloads above one mebibyte",
+      "rank": 1,
+      "unscoped": true,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 39.4,
+      "top": [
+        "tests/test_payload.py:1-4",
+        "src/payload.py:1-5",
+        "README.md:6-7",
+        "src/otlp/mod.rs:682-692",
+        "src/http/traces.rs:48-110"
+      ]
+    }
+  ],
+  "fixture": {
+    "corpus_sha256": "9341baccc91928bc2e9c40c6d94e2c55fd591c45551a08eaa5d59aca8dee6e5e",
+    "commits": {
+      "platform": "6da64f3218bed9576819c53e4f4c9afb2b48942a",
+      "coding-plugin": "d3a1ba5516525dac18815c6ca8fd13fa5b44f064",
+      "registry": "399ae67cc5bd6149a197def7b513c9f433541961",
+      "sdk-python": "399ae67cc5bd6149a197def7b513c9f433541961",
+      "sdk-browser": "6cfcd01ac8d954aea4d4bdd1dac986bfb4b904bc",
+      "qa-exports": "b8268aaed17dd239b363daa87616c6f414323ec0"
+    }
+  }
+}

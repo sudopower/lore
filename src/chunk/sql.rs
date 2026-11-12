@@ -65,22 +65,23 @@ pub fn chunk(content: &str) -> Vec<Chunk> {
 /// Statements that share a chunk.
 struct Group {
     span: Span,
-    /// The object the group is about: its first statement's that names one.
-    subject: Option<String>,
     names: Vec<String>,
     keys: Vec<String>,
     /// Some statement of the group lists values: seed rows, an enum type, a `CHECK ... IN`.
     enumerates: bool,
+    identities: Vec<String>,
+    value_changes: Vec<String>,
 }
 
 impl Group {
     fn new(about: About, span: Span) -> Self {
         let mut g = Group {
             span,
-            subject: None,
             names: Vec::new(),
             keys: Vec::new(),
             enumerates: false,
+            identities: Vec::new(),
+            value_changes: Vec::new(),
         };
         g.add(about, span);
         g
@@ -93,8 +94,8 @@ impl Group {
         if span.start <= self.span.end {
             return true;
         }
-        let related = match (&self.subject, &about.subject) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        let related = match (self.identities.first(), about.identities.first()) {
+            (Some(a), Some(b)) => a == b,
             _ => true,
         };
         related && span.end.saturating_sub(self.span.start) < GROUP_LINES
@@ -103,8 +104,13 @@ impl Group {
     fn add(&mut self, about: About, span: Span) {
         self.span.end = self.span.end.max(span.end);
         self.enumerates |= about.enumerates;
-        if self.subject.is_none() {
-            self.subject = about.subject;
+        for identity in about.identities {
+            if about.changes_values && !self.value_changes.contains(&identity) {
+                self.value_changes.push(identity.clone());
+            }
+            if !self.identities.contains(&identity) {
+                self.identities.push(identity);
+            }
         }
         for name in about.names {
             if !self.names.contains(&name) {
@@ -132,7 +138,7 @@ impl Group {
         if group_lines.len() <= MAX_ITEM_LINES {
             let symbols = self.names.iter().chain(&self.keys).cloned().collect();
             return Chunk::from_lines(group_lines, self.span.start, symbols, kind)
-                .map(|c| c.enumerating(self.enumerates))
+                .map(|c| self.annotate(c))
                 .into_iter()
                 .collect();
         }
@@ -145,8 +151,17 @@ impl Group {
             kind,
         )
         .into_iter()
-        .map(|c| c.enumerating(self.enumerates))
+        .map(|c| self.annotate(c))
         .collect()
+    }
+
+    fn annotate(&self, c: Chunk) -> Chunk {
+        Chunk {
+            sql_subjects: self.identities.iter().map(|s| s.to_lowercase()).collect(),
+            sql_identities: self.identities.clone(),
+            sql_value_changes: self.value_changes.clone(),
+            ..c.enumerating(self.enumerates)
+        }
     }
 }
 
@@ -305,6 +320,9 @@ struct About {
     /// The statement lists values: two or more `VALUES` rows, an enum type (`AS ENUM`, ClickHouse
     /// `Enum8(...)`), or a `CHECK (... IN (...))`.
     enumerates: bool,
+    /// Canonical object identities, preserving the case of quoted components.
+    identities: Vec<String>,
+    changes_values: bool,
 }
 
 impl About {
@@ -315,6 +333,8 @@ impl About {
             names,
             keys: Vec::new(),
             enumerates: false,
+            identities: Vec::new(),
+            changes_values: false,
         }
     }
 }
@@ -346,6 +366,7 @@ fn about(code: &str) -> About {
     let mut p = Cursor {
         tokens: &tokens,
         i: 0,
+        names: Vec::new(),
     };
     let Some(verb) = p.word() else {
         return About::default();
@@ -353,10 +374,12 @@ fn about(code: &str) -> About {
     let mut about = match verb.to_ascii_uppercase().as_str() {
         "CREATE" => create(&mut p),
         "ALTER" => {
-            p.kind();
+            let kind = p.kind();
             p.eat(&["IF", "EXISTS"]);
             p.eat(&["ONLY"]);
-            About::of(p.name().into_iter().collect(), None)
+            let mut about = About::of(p.name().into_iter().collect(), None);
+            about.changes_values = changes_allowed_values(&kind, &mut p);
+            about
         }
         "DROP" => drop(&mut p),
         "INSERT" => insert(&mut p),
@@ -391,7 +414,154 @@ fn about(code: &str) -> About {
         _ => About::default(),
     };
     about.enumerates |= lists_values(&tokens);
+    // Keep the lexical symbols as written, but persist object identity separately. Recording
+    // identifier components while parsing preserves the difference between "a.b" and a.b.
+    let kind = subject_kind(&tokens);
+    let has_on = tokens
+        .iter()
+        .any(|t| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case("ON")));
+    let subjects = if verb.eq_ignore_ascii_case("DROP") && !has_on {
+        p.names.clone()
+    } else {
+        // CREATE INDEX/TRIGGER/POLICY/RULE and DROP ... ON name the owning table last.
+        // Use the parsed identifier components, not the display spelling: a.b and "a.b"
+        // can have the same display name but identify different objects in one statement.
+        let named = if has_on
+            && (verb.eq_ignore_ascii_case("CREATE") || verb.eq_ignore_ascii_case("DROP"))
+        {
+            p.names.last()
+        } else {
+            p.names.first()
+        };
+        named.map(|parts| {
+            let mut parts = parts.clone();
+            if verb.eq_ignore_ascii_case("COMMENT")
+                && matches!(tokens.get(2), Some(Token::Word(w)) if w.eq_ignore_ascii_case("COLUMN")) {
+                parts.pop();
+            }
+            parts
+        }).into_iter().collect()
+    };
+    for parts in subjects {
+        if about.subject.is_some() && !parts.is_empty() {
+            about.identities.push(identity(&kind, &parts));
+        }
+    }
     about
+}
+
+/// Only structural ALTER forms that change allowed values. The splitter has removed
+/// comments; strings and quoted identifiers are not keyword tokens. Each statement has one
+/// canonical owner, so grouping multiple objects cannot transfer this flag between them.
+fn changes_allowed_values(kind: &str, p: &mut Cursor<'_>) -> bool {
+    if kind.eq_ignore_ascii_case("TYPE") {
+        if p.eat(&["ADD", "VALUE"]) {
+            p.eat(&["IF", "NOT", "EXISTS"]);
+            return matches!(p.rest().first(), Some(Token::Str(_)));
+        }
+        if p.eat(&["RENAME", "VALUE"]) && matches!(p.rest().first(), Some(Token::Str(_))) {
+            p.i += 1;
+            return p.eat(&["TO"]) && matches!(p.rest().first(), Some(Token::Str(_)));
+        }
+        return false;
+    }
+    if !kind.eq_ignore_ascii_case("TABLE") {
+        return false;
+    }
+    // Split only at top-level action commas. A CHECK inside a column DEFAULT/function or
+    // another nested expression is not a table-level ADD CHECK action.
+    let tokens = p.rest();
+    let mut actions = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            Token::Punct(',') if depth == 0 => {
+                actions.push(&tokens[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    actions.push(&tokens[start..]);
+    actions.into_iter().any(|tokens| {
+        let mut action = Cursor {
+            tokens,
+            i: 0,
+            names: Vec::new(),
+        };
+        if !action.eat(&["ADD"]) {
+            return false;
+        }
+        if action.eat(&["CONSTRAINT"]) {
+            if !matches!(
+                action.rest().first(),
+                Some(Token::Word(_) | Token::Quoted(_))
+            ) {
+                return false;
+            }
+            action.i += 1;
+        }
+        action.eat(&["CHECK"])
+            && action.punct('(')
+            && !matches!(action.rest().first(), None | Some(Token::Punct(')')))
+    })
+}
+
+/// Include the kind to avoid linking a table and a type with the same spelling. Indexes,
+/// triggers, policies and rules created ON a table inherit that table's identity.
+fn subject_kind(tokens: &[Token]) -> String {
+    let mut p = Cursor {
+        tokens,
+        i: 1,
+        names: Vec::new(),
+    };
+    if matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("COMMENT")) {
+        p.eat(&["ON"]);
+    }
+    let kind = p.kind().to_ascii_uppercase();
+    if kind == "TYPE" {
+        "type".to_string()
+    } else if ON_TABLE.contains(&kind.as_str())
+        && matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("DROP") || w.eq_ignore_ascii_case("ALTER"))
+        && !tokens
+            .iter()
+            .any(|t| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case("ON")))
+    {
+        kind.to_ascii_lowercase()
+    } else if matches!(
+        kind.as_str(),
+        "TABLE" | "COLUMN" | "INDEX" | "TRIGGER" | "POLICY" | "RULE"
+    ) || matches!(tokens.first(), Some(Token::Word(w)) if ["INSERT", "UPDATE", "DELETE", "TRUNCATE"].iter().any(|v| w.eq_ignore_ascii_case(v)))
+    {
+        "table".to_string()
+    } else {
+        kind.to_ascii_lowercase()
+    }
+}
+
+fn identity(kind: &str, parts: &[String]) -> String {
+    let mut parts = parts.to_vec();
+    if parts.len() == 1 {
+        parts.insert(0, "public".to_string());
+    }
+    // Always quote each component, so embedded dots/quotes cannot collide with qualification.
+    let name = parts
+        .iter()
+        .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{kind}:{name}")
 }
 
 fn create(p: &mut Cursor) -> About {
@@ -586,6 +756,7 @@ fn unquote(chars: &[char], from: usize, to: usize, quote: char) -> String {
 struct Cursor<'a> {
     tokens: &'a [Token],
     i: usize,
+    names: Vec<Vec<String>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -651,8 +822,13 @@ impl<'a> Cursor<'a> {
     fn name(&mut self) -> Option<String> {
         let tokens = self.tokens;
         let mut parts = Vec::new();
+        let mut normalized = Vec::new();
         while let Some(Token::Word(part) | Token::Quoted(part)) = tokens.get(self.i) {
             parts.push(part.as_str());
+            normalized.push(match &tokens[self.i] {
+                Token::Quoted(_) => part.clone(),
+                _ => part.to_lowercase(),
+            });
             self.i += 1;
             let dotted = tokens.get(self.i) == Some(&Token::Punct('.'))
                 && matches!(
@@ -664,7 +840,13 @@ impl<'a> Cursor<'a> {
             }
             self.i += 1;
         }
-        (!parts.is_empty()).then(|| parts.join("."))
+        if parts.is_empty() {
+            None
+        } else {
+            let name = parts.join(".");
+            self.names.push(normalized);
+            Some(name)
+        }
     }
 
     /// Moves just past the next keyword `kw` outside parentheses, when there is one.
@@ -794,6 +976,55 @@ CREATE TABLE IF NOT EXISTS public.seats (
 );
 ALTER TABLE ONLY public.seats ADD COLUMN email text;
 ";
+
+    #[test]
+    fn value_mutations_use_structural_tokens_and_their_own_canonical_subject() {
+        for code in [
+            "ALTER TYPE app.\"Signal\" ADD VALUE IF NOT EXISTS 'amber';",
+            "ALTER TYPE app.\"Signal\" RENAME VALUE 'amber' TO 'green';",
+            "ALTER TABLE app.\"Signal\" ADD CHECK (state IN ('amber', 'green'));",
+            "ALTER TABLE app.\"Signal\" DROP CONSTRAINT old, ADD CONSTRAINT \"CHECK\" CHECK ((state IN ('amber', 'green'))) NOT VALID;",
+            "ALTER /* CHECK belongs to a comment */ TABLE app.\"Signal\" ADD CONSTRAINT c CHECK (state > 0);",
+        ] {
+            let chunk = chunk_file("m.sql", code).remove(0);
+            assert_eq!(chunk.sql_value_changes, chunk.sql_identities, "{code}");
+        }
+        for code in [
+            "ALTER TABLE t ADD COLUMN body text;",
+            "ALTER TABLE t ADD COLUMN body text DEFAULT 'ADD CHECK (state IN (1,2))';",
+            "ALTER TABLE t ADD COLUMN body text DEFAULT $$ADD CHECK (state IN (1,2))$$;",
+            "ALTER TABLE t ADD COLUMN body text; -- ADD CHECK (state IN (1,2))",
+            "ALTER TABLE t ADD COLUMN \"CHECK\" text;",
+            "ALTER TABLE t ADD COLUMN x text CHECK (x IN ('a', 'b'));",
+            "ALTER TABLE t ADD CONSTRAINT c UNIQUE (state);",
+            "ALTER TABLE t DROP CONSTRAINT state_check;",
+            "ALTER TABLE t ADD CHECK (state IN ('a', 'b');",
+            "ALTER TYPE t ADD ATTRIBUTE value text;",
+            "COMMENT ON TABLE t IS 'ALTER TYPE t ADD VALUE ''x''';",
+            "ALTER TYPE t ADD \"VALUE\" 'x';",
+        ] {
+            assert!(
+                chunk_file("m.sql", code)
+                    .iter()
+                    .all(|c| c.sql_value_changes.is_empty()),
+                "{code}"
+            );
+        }
+        let chunks = chunk_file(
+            "m.sql",
+            "ALTER TABLE app.\"Mixed\" ADD COLUMN body text DEFAULT 'CHECK (x IN (1,2))'; ALTER TABLE app.mixed ADD CHECK (x IN (1,2));",
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sql_identities.len(), 2);
+        assert_eq!(chunks[0].sql_value_changes, ["table:\"app\".\"mixed\""]);
+        let long = format!(
+            "ALTER TABLE t DROP CONSTRAINT \"{}\", ADD CHECK (state IN (1,2));",
+            "x".repeat(8500)
+        );
+        let chunks = chunk_file("m.sql", &long);
+        assert!(!chunks[0].text.contains("ADD CHECK"));
+        assert_eq!(chunks[0].sql_value_changes, ["table:\"public\".\"t\""]);
+    }
 
     #[test]
     fn a_table_and_its_indexes_share_a_chunk() {
@@ -1066,5 +1297,98 @@ SELECT name, count() AS n FROM otel.spans GROUP BY name;
         let chunks = chunk_file("m.sql", src);
         assert_eq!(chunks.len(), 1);
         assert_eq!(range(&chunks[0]), (1, 3));
+    }
+
+    #[test]
+    fn subjects_are_case_folded_qualified_and_separate_from_symbols() {
+        let cases = [
+            (
+                "CREATE TABLE Accounts (id int);",
+                vec!["table:\"public\".\"accounts\""],
+            ),
+            (
+                "ALTER TABLE PUBLIC.\"Accounts\" ADD COLUMN status text;",
+                vec!["table:\"public\".\"accounts\""],
+            ),
+            (
+                "ALTER TYPE app.Stage ADD VALUE 'done';",
+                vec!["type:\"app\".\"stage\""],
+            ),
+            (
+                "CREATE INDEX a_status ON app.Accounts(status);",
+                vec!["table:\"app\".\"accounts\""],
+            ),
+            (
+                "DROP TABLE IF EXISTS a, app.b;",
+                vec!["table:\"public\".\"a\"", "table:\"app\".\"b\""],
+            ),
+            (
+                "DELETE FROM Accounts;",
+                vec!["table:\"public\".\"accounts\""],
+            ),
+            (
+                "CREATE TABLE \"a.b\" (id int);",
+                vec!["table:\"public\".\"a.b\""],
+            ),
+            ("CREATE TABLE a.b (id int);", vec!["table:\"a\".\"b\""]),
+            (
+                "COMMENT ON COLUMN app.Accounts.status IS 'states';",
+                vec!["table:\"app\".\"accounts\""],
+            ),
+            (
+                "BEGIN; CREATE TABLE a (id int); CREATE TYPE b AS ENUM ('x');",
+                vec!["table:\"public\".\"a\"", "type:\"public\".\"b\""],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let chunks = chunk(sql);
+            let subjects: Vec<&str> = chunks
+                .iter()
+                .flat_map(|c| c.sql_subjects.iter().map(String::as_str))
+                .collect();
+            assert_eq!(subjects, expected, "{sql}");
+        }
+        let c = chunk("CREATE TABLE Accounts (id int);").remove(0);
+        assert_eq!(c.symbols, ["Accounts"]);
+        assert!(chunk("SELECT * FROM accounts;")[0].sql_subjects.is_empty());
+    }
+
+    #[test]
+    fn quoted_case_is_kept_in_identity_but_subject_keys_are_folded() {
+        let chunks =
+            chunk("CREATE TABLE \"Accounts\" (id int);\nCREATE TABLE accounts (id int);\n");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sql_subjects, chunks[1].sql_subjects);
+        assert_eq!(chunks[0].sql_identities, ["table:\"public\".\"Accounts\""]);
+        assert_eq!(chunks[1].sql_identities, ["table:\"public\".\"accounts\""]);
+        let lower_quoted = chunk("ALTER TABLE \"public\".\"accounts\" ADD COLUMN x int;");
+        assert_eq!(lower_quoted[0].sql_identities, chunks[1].sql_identities);
+    }
+
+    #[test]
+    fn identical_display_names_do_not_lose_quoted_identifier_boundaries() {
+        let dropped = chunk("DROP TABLE a.b, \"a.b\";");
+        assert_eq!(
+            dropped[0].sql_identities,
+            ["table:\"a\".\"b\"", "table:\"public\".\"a.b\""]
+        );
+        let indexed = chunk("CREATE INDEX \"a.b\" ON a.b (id);");
+        assert_eq!(indexed[0].sql_identities, ["table:\"a\".\"b\""]);
+        let comment = chunk("COMMENT ON COLUMN \"a.b\".\"c.d\" IS 'label';");
+        assert_eq!(comment[0].sql_identities, ["table:\"public\".\"a.b\""]);
+    }
+
+    #[test]
+    fn subjects_and_long_identifiers_are_not_silently_dropped() {
+        let sql = (0..100)
+            .map(|i| format!("CREATE TABLE t{i} (id int); "))
+            .collect::<String>();
+        let chunks = chunk(&sql);
+        assert_eq!(chunks[0].sql_subjects.len(), 100);
+        assert_eq!(chunks[0].sql_identities.len(), 100);
+        let long = format!("CREATE TABLE \"{}\" (id int);", "x".repeat(300));
+        assert_eq!(chunk(&long)[0].sql_subjects.len(), 1);
+        assert!(chunk(&long)[0].sql_identities[0].contains(&"x".repeat(300)));
+        assert!(chunk(&long)[0].text.contains("CREATE TABLE"));
     }
 }

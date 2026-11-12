@@ -77,7 +77,7 @@ pub async fn answer(
             _ => AppError::Internal(e),
         })?;
 
-    let answer: String = res
+    let mut answer: String = res
         .content
         .iter()
         .filter_map(|b| match b {
@@ -85,6 +85,13 @@ pub async fn answer(
             _ => None,
         })
         .collect();
+    // This warning is deterministic, not dependent on a model following the prompt. Only
+    // sources actually sent to the model are labelled and cited.
+    for (i, hit) in hits[..included].iter().enumerate() {
+        if let Some(note) = hit.sql_change_note() {
+            answer.push_str(&format!("\n\nSQL source [{}]: {note}.", i + 1));
+        }
+    }
     let citations = parse_citations(&answer, &hits[..included]);
     Ok(AskResponse {
         answer,
@@ -146,6 +153,7 @@ mod tests {
             symbols: Vec::new(),
             text: String::new(),
             score: 0.03,
+            later_changes: Vec::new(),
         }
     }
 

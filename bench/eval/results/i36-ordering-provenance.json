@@ -1,0 +1,63 @@
+{
+  "baseline": {
+    "commit": "4c981d4620fdc3e3d34399b12f57456c71b08285",
+    "source_sha256": "11e8b41ab4e185cfcb712ca16baae8434de55df7a66a3668c28cf05e80b33016",
+    "binary_sha256": "9b615f3b77e6650918b12d5de1ebfc05fa0021cee34d1a828bcea5be69b3d6ef"
+  },
+  "candidate": {
+    "commit": "d7b8fba9c19e8d0b22893af3cde6fb43532760de",
+    "source_sha256": "f611b4fe1d2bbdf652455302d5ed491e66705c159fad39dd40cb2b38f33fe4c4",
+    "binary_sha256": "5262e10dc66112f7b89286999dda28e0c7feec97c557bb484a20ff6e213dc51f"
+  },
+  "source_hash_scope": "Sorted git ls-files src migrations Cargo.toml Cargo.lock build.rs; concatenate each path, NUL, exact file bytes, NUL; SHA256",
+  "embedder": "fastembed:bge-small-en-v1.5",
+  "model_snapshot": "ea104dacec62c0de699686887e3f920caeb4f3e3",
+  "llm": "fake",
+  "profile": "debug",
+  "build_jobs": 2,
+  "incremental": false,
+  "validation": {
+    "make_lint": "pass",
+    "make_test": "pass",
+    "passed": 709,
+    "ignored": 6,
+    "test_binaries": 33,
+    "paid_llm_calls": 0
+  },
+  "public_fixture": {
+    "commit": "105500e75cdf3d65886d5220ca070440735b50bb",
+    "indexed_files_each_variant": 117,
+    "chunks_each_variant": 1773
+  },
+  "sql_fixture": {
+    "path": "bench/eval/fixtures/sql-chronology",
+    "indexed_files_each_variant": 14,
+    "chunks_each_variant": 24,
+    "gold_unchanged": true
+  },
+  "multi_fixture": {
+    "mixed_public_sql_multirepo_tenant": true,
+    "comparable_to_isolated_multirepo_1_000": false
+  },
+  "cache": {
+    "identical_content_addressed_rows_reused": 1819,
+    "keys_or_vectors_modified": false,
+    "fresh_validation_database": true,
+    "normal_migrations_without_ledger_edits": true
+  },
+  "runtime_proof": {
+    "baseline_later_sql_warning": false,
+    "candidate_later_sql_warning": true,
+    "candidate_check_original_latest_positions": [2, 1],
+    "candidate_enum_original_latest_positions": [2, 1],
+    "baseline_enum_original_latest_positions": [1, 2]
+  },
+  "results": [
+    "i36-ordering-baseline-public.json",
+    "i36-ordering-sql-public.json",
+    "i36-ordering-baseline-sql.json",
+    "i36-ordering-sql-sql.json",
+    "i36-ordering-baseline-multi.json",
+    "i36-ordering-sql-multi.json"
+  ]
+}

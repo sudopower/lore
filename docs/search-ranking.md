@@ -30,6 +30,12 @@ MCP, sources answers and model passages. Similar snippets do not collapse. Repea
 confined to one source retain separate locations. Only the current tenant and requested source
 and kind filters can contribute duplicate names. No second unfiltered lookup is used.
 
+SQL chunks with stored object subjects also require an identical full migration path to
+collapse. Identical text at different migration positions remains separate chronological
+evidence. For a collapsed SQL passage, latest-change lookup still checks each original
+source separately. Companions retain their actual source/file, and historical warnings use
+`source:path`, so a change in one alias is not attributed to another source.
+
 ## Reproducing the multi-repo regression eval
 
 Use a local server with the real `fastembed` embedder and the fake LLM, not the hash embedder.

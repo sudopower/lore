@@ -752,6 +752,7 @@ mod tests {
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
             text: "pub enum Plan {\n    Free }".to_string(),
             score: 0.03,
+            later_changes: Vec::new(),
         }
     }
 

@@ -8,8 +8,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{
-    bundle, create_repo, create_tenant_key, head, push_fixture, put_bundle, send, serve_router,
-    test_router, test_state,
+    bundle, commit_all, create_repo, create_tenant_key, head, push_fixture, put_bundle, send,
+    serve_router, test_router, test_state,
 };
 use lore::http::AppState;
 use serde_json::{Value, json};
@@ -49,7 +49,24 @@ impl Env {
     /// A tenant with a pushed repo, a note, trace spans with their queued session and a key.
     async fn full_tenant(&self, name: &str) -> (Uuid, String, Uuid) {
         let (tenant, key) = create_tenant_key(&self.router, name, &["ingest", "read"]).await;
-        let (source, _repo) = push_fixture(&self.router, &key).await;
+        let (source, repo) = push_fixture(&self.router, &key).await;
+        // Exercise every tenant-owned table, including the SQL subject lookup's cascade.
+        std::fs::write(
+            repo.path().join("schema.sql"),
+            "CREATE TABLE cleanup (id int);",
+        )
+        .unwrap();
+        commit_all(&repo, "Fixture: Add SQL cascade evidence");
+        let (status, body) = put_bundle(
+            &self.router,
+            &key,
+            source,
+            bundle(&repo, &["HEAD"]),
+            &head(&repo),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let note = json!({
             "source": "notes",
             "documents": [{ "external_id": "n1", "title": "Review", "text": "zorblax review" }]

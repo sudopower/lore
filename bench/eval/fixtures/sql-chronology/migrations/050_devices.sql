@@ -1,0 +1,1 @@
+ALTER TABLE APP.DEVICE_STATE ADD COLUMN maintenance_reason text;

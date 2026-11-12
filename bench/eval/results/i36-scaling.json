@@ -1,0 +1,84 @@
+{
+  "source_commit": "58adaceb4be7f8dbc07c0c341853e872544e111d",
+  "ordering_variant": "historical unconditional newest-first, before structural per-identity ordering refinement",
+  "applicability": "Same lookup/index keys and predicates; historical index-scaling observation, not final-executable timing",
+  "model_snapshot": "ea104dacec62c0de699686887e3f920caeb4f3e3",
+  "profile": "debug",
+  "build_jobs": 2,
+  "incremental": false,
+  "test_binary_sha256": "b67c1caf3e15eabc458c7165afa029cfc07da7305f687bc5b379b1e9c3884188",
+  "entrypoint": "real store::index_text and authenticated GET /v1/search HTTP handler",
+  "query": "pending active locked closed trial paused",
+  "k": 5,
+  "processes": "one fresh process per case, one model load, eight searches",
+  "memory_scope": "test process peak RSS including two local model instances, excluding PostgreSQL",
+  "path_scope": "full metadata paths with independent short document IDs; not a claim Git/checkout accepts every path",
+  "cases": [
+    {
+      "rows": 1000,
+      "path_bytes": 0,
+      "embedder": "fastembed:bge-small-en-v1.5",
+      "model_load_ms": 515.6056249999999,
+      "ingest_ms": 52352.498708,
+      "first_ms": 40.10225,
+      "steady_median_ms": 13.324208,
+      "worst_ms": 40.10225,
+      "all_ms": [
+        40.10225,
+        13.777958,
+        13.317584,
+        13.064041999999999,
+        13.324208,
+        12.959083,
+        21.366083,
+        17.9075
+      ],
+      "max_rss_bytes": 575832064,
+      "documents": 1001
+    },
+    {
+      "rows": 1000,
+      "path_bytes": 2049,
+      "embedder": "fastembed:bge-small-en-v1.5",
+      "model_load_ms": 457.754167,
+      "ingest_ms": 58557.649791,
+      "first_ms": 63.01862499999999,
+      "steady_median_ms": 34.22925,
+      "worst_ms": 63.01862499999999,
+      "all_ms": [
+        63.01862499999999,
+        35.024333999999996,
+        35.650167,
+        34.727167,
+        34.22925,
+        32.258,
+        31.785584,
+        31.024917
+      ],
+      "max_rss_bytes": 513818624,
+      "documents": 1001
+    },
+    {
+      "rows": 1000,
+      "path_bytes": 16384,
+      "embedder": "fastembed:bge-small-en-v1.5",
+      "model_load_ms": 469.079542,
+      "ingest_ms": 81052.199209,
+      "first_ms": 133.7205,
+      "steady_median_ms": 57.647041,
+      "worst_ms": 133.7205,
+      "all_ms": [
+        133.7205,
+        70.136459,
+        66.33179200000001,
+        64.606834,
+        57.575,
+        57.647041,
+        56.999208,
+        56.733458
+      ],
+      "max_rss_bytes": 531693568,
+      "documents": 1001
+    }
+  ]
+}

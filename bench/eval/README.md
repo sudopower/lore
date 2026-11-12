@@ -69,6 +69,34 @@ The public set has 20 questions, 4 per category, about lore at commit `105500e`.
 
 Private sets about other code live outside this repo and are passed by path, for example `bench/eval/eval mine $LORE_URL $LORE_KEY ~/lore-eval/private.json`. Push each repo under the name its questions use, at the recorded commit.
 
+## SQL chronology fixture
+
+```bash
+LORE_BIN=target/debug/lore bash bench/eval/sql.sh sql-branch
+bench/eval/eval --diff sql-baseline sql-branch
+```
+
+Run each label against a server built from the corresponding revision, using the same local `fastembed` model and database configuration. `sql.sh` indexes only `fixtures/sql-chronology/` under source `sql-chronology` and runs `questions/sql-chronology.json` through the same retrieval harness. It creates a new tenant unless `EVAL_KEY` is supplied. It needs configured Git commit identity to make its temporary fixture repo.
+
+The 12 hand-labelled cases require both the original definition and the newest change (`need: all`). They cover a six-to-seven-value CHECK, enum ADD VALUE, multi-object DROP, explicit schemas, default-schema qualification, case-folded keys with distinct quoted-case identities, quoted dots, table/type identity, and bytewise path ordering. The gold ranges and reference answers are written from the fixture SQL, not from search output. The fixture is searchable SQL text, not an executable database migration suite; identity collision cases deliberately exercise the chunker's cross-dialect normalization. It does not call an LLM or grade generated answers. Compare the public set separately, and check newest-before-original ordering with `tests/sql_chronology.rs`, since the harness's overlap metrics alone do not require that order.
+
+An opt-in scaling measurement uses the real cached embedder, the actual store, and the
+HTTP search handler. Run one history size/path length per fresh process:
+
+```bash
+LORE_SQL_PERF_MODEL_DIR=/absolute/path/to/data/models \
+LORE_SQL_PERF_ROWS=1000 LORE_SQL_PERF_PATH_BYTES=0 \
+cargo test --test sql_chronology measure_sql_history_scaling -- --ignored --nocapture
+```
+
+`0` uses ordinary migration paths; `2049` or `16384` exercises matching overflow
+paths. The fixture keeps document IDs short without shortening metadata paths, so this
+measures valid store/search inputs independently of existing Git/checkout/ID ingestion
+limits. It records model load and ingestion separately, then first-call, steady median
+and worst HTTP-handler latency. It checks that its ordinary `ADD COLUMN` companion follows
+the original definition and remains evidence. The model must already be cached. This is a local scaling
+observation, not a production latency bound.
+
 ## Agent comparison
 
 ```bash

@@ -104,6 +104,23 @@ pub struct Hit {
     pub text: String,
     /// The Reciprocal Rank Fusion score: higher is better.
     pub score: f64,
+    /// A later SQL migration names the same object. Internal answer annotation, not a wire field.
+    pub later_changes: Vec<String>,
+}
+
+impl Hit {
+    pub fn sql_change_note(&self) -> Option<String> {
+        if self.later_changes.is_empty() {
+            return None;
+        }
+        let paths = self
+            .later_changes
+            .iter()
+            .map(|path| format!("`{}`", path.replace(['`', '\n', '\r'], "'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("later SQL changes in {paths}"))
+    }
 }
 
 /// The columns of a hit, plus what `uri` is rendered from.
@@ -125,6 +142,8 @@ struct HitRow {
     text: String,
     is_test: bool,
     is_generated: bool,
+    /// Full, uncut path only for chunks with stored SQL subjects. Never a wire field.
+    sql_path: Option<String>,
 }
 
 impl HitRow {
@@ -159,6 +178,7 @@ impl HitRow {
             symbols: self.symbols,
             text: self.text,
             score,
+            later_changes: Vec::new(),
         }
     }
 }
@@ -250,7 +270,10 @@ pub async fn search(
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let mut by_id =
         hit_rows_by_id(&mut *tx, query.tenant_id, &ids, filter.kinds, filter.source).await?;
-    tx.commit().await?;
+    let mut sql_positions: HashMap<i64, String> = by_id
+        .iter()
+        .filter_map(|(&id, row)| row.sql_path.clone().map(|path| (id, path)))
+        .collect();
     let intent = RankingIntent::new(q);
     let mut hits: Vec<Hit> = fused
         .into_iter()
@@ -262,7 +285,52 @@ pub async fn search(
         })
         .collect();
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-    Ok(collapse_duplicates(hits, k))
+    let (hits, origins) = collapse_duplicates(hits, k, &sql_positions);
+    if !hits
+        .iter()
+        .any(|hit| sql_positions.contains_key(&hit.chunk_id))
+    {
+        tx.commit().await?;
+        return Ok(hits);
+    }
+    let fused = hits.iter().map(|h| (h.chunk_id, h.score)).collect();
+    // Expand every authorized original behind a representative, not another source merely
+    // sharing an object name. Keep lookup and companion hydration on the same MVCC snapshot.
+    let (expanded, later_changes) = sql_changes(&mut tx, fused, &origins, &filter).await?;
+    let mut by_id: HashMap<i64, Hit> = hits.into_iter().map(|h| (h.chunk_id, h)).collect();
+    let missing: Vec<i64> = expanded
+        .iter()
+        .filter_map(|(id, _)| (!by_id.contains_key(id)).then_some(*id))
+        .collect();
+    if !missing.is_empty() {
+        let rows = hit_rows_by_id(
+            &mut *tx,
+            query.tenant_id,
+            &missing,
+            filter.kinds,
+            filter.source,
+        )
+        .await?;
+        for (id, row) in rows {
+            if let Some(path) = &row.sql_path {
+                sql_positions.insert(id, path.clone());
+            }
+            by_id.insert(id, row.into_hit(0.0));
+        }
+    }
+    tx.commit().await?;
+    let hits = expanded
+        .into_iter()
+        .filter_map(|(id, score)| {
+            by_id.remove(&id).map(|hit| Hit {
+                score,
+                later_changes: later_changes.get(&id).cloned().unwrap_or_default(),
+                ..hit
+            })
+        })
+        .collect();
+    // Apply k after companion collapse too, so duplicate companions cannot consume its slots.
+    Ok(collapse_duplicates(hits, k, &sql_positions).0)
 }
 
 /// The tenant's chunks with these ids as hits with score 0, by id. One query for all rows; ids of
@@ -298,7 +366,9 @@ where
                 CASE WHEN d.kind = 'session' THEN d.external_id END AS external_id,
                 d.metadata->>'commit' AS commit,
                 s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text,
-                c.is_test, c.is_generated
+                c.is_test, c.is_generated,
+                CASE WHEN cardinality(c.sql_subjects) > 0
+                     THEN d.metadata->>'path' END AS sql_path
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
@@ -388,36 +458,193 @@ impl RankingIntent {
 }
 
 /// Collapse identical text shared across sources. Repeats confined to one source retain
-/// separate locations. Compare full text, never snippets or a hash alone, before k.
-fn collapse_duplicates(hits: Vec<Hit>, k: usize) -> Vec<Hit> {
-    let mut first_source: HashMap<&str, &str> = HashMap::new();
-    let mut shared: HashSet<String> = HashSet::new();
+/// separate locations. SQL also requires the same full migration path: identical text at
+/// different chronological positions is different evidence. Origins stay private and bounded
+/// by the retrieved candidate pool. Compare full text, never snippets or a hash alone, before k.
+fn collapse_duplicates(
+    hits: Vec<Hit>,
+    k: usize,
+    sql_positions: &HashMap<i64, String>,
+) -> (Vec<Hit>, HashMap<i64, Vec<i64>>) {
+    let mut first_source: HashMap<(&str, Option<&str>), &str> = HashMap::new();
+    let mut shared: HashSet<(String, Option<String>)> = HashSet::new();
     for hit in &hits {
-        if let Some(source) = first_source.insert(&hit.text, &hit.source)
+        let path = sql_positions.get(&hit.chunk_id);
+        if let Some(source) =
+            first_source.insert((&hit.text, path.map(String::as_str)), &hit.source)
             && source != hit.source
         {
-            shared.insert(hit.text.clone());
+            shared.insert((hit.text.clone(), path.cloned()));
         }
     }
-    let mut groups: HashMap<String, usize> = HashMap::new();
+    let mut groups: HashMap<(String, Option<String>), usize> = HashMap::new();
+    let mut origins: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut out: Vec<Hit> = Vec::new();
     for hit in hits {
-        if shared.contains(&hit.text) {
-            if let Some(&i) = groups.get(&hit.text) {
-                if out[i].source != hit.source && !out[i].also_in.contains(&hit.source) {
-                    out[i].also_in.push(hit.source);
+        let key = (hit.text.clone(), sql_positions.get(&hit.chunk_id).cloned());
+        if shared.contains(&key) {
+            if let Some(&i) = groups.get(&key) {
+                origins
+                    .get_mut(&out[i].chunk_id)
+                    .unwrap()
+                    .push(hit.chunk_id);
+                for source in std::iter::once(hit.source).chain(hit.also_in) {
+                    if out[i].source != source && !out[i].also_in.contains(&source) {
+                        out[i].also_in.push(source);
+                    }
+                }
+                for path in hit.later_changes {
+                    if !out[i].later_changes.contains(&path) {
+                        out[i].later_changes.push(path);
+                    }
                 }
                 continue;
             }
-            groups.insert(hit.text.clone(), out.len());
+            groups.insert(key, out.len());
         }
+        origins.insert(hit.chunk_id, vec![hit.chunk_id]);
         out.push(hit);
     }
     for hit in &mut out {
         hit.also_in.sort();
     }
     out.truncate(k);
-    out
+    let retained: HashSet<i64> = out.iter().map(|h| h.chunk_id).collect();
+    origins.retain(|id, _| retained.contains(id));
+    (out, origins)
+}
+
+#[derive(Clone, sqlx::FromRow)]
+struct SqlChange {
+    origin: i64,
+    id: i64,
+    path: String,
+    changes_values: bool,
+}
+
+type SqlExpansion = (Vec<(i64, f64)>, HashMap<i64, Vec<String>>);
+
+/// Add the newest migration for each retrieved SQL subject. Allowed-value mutations precede
+/// older evidence; other companions follow their parent without demoting an earlier hit. The
+/// source id, tenant and kind remain fixed. Paths use bytewise ordering, not locale, timestamps,
+/// natural-number ordering or ingestion order. Each subject contributes at most one companion.
+async fn sql_changes(
+    conn: &mut PgConnection,
+    fused: Vec<(i64, f64)>,
+    origins: &HashMap<i64, Vec<i64>>,
+    f: &Filter<'_>,
+) -> Result<SqlExpansion, AppError> {
+    let ids: Vec<i64> = origins.values().flatten().copied().collect();
+    let mut changes: Vec<SqlChange> = sqlx::query_as(
+        "SELECT base.id AS origin, latest.id, s.name || ':' || latest.path AS path,
+                latest.changes_values
+         FROM chunks base
+         JOIN documents original ON original.id = base.document_id
+         JOIN sources s ON s.id = original.source_id
+         JOIN sql_subject_lookup original_subject ON original_subject.chunk_id = base.id
+         CROSS JOIN LATERAL (
+             SELECT candidate.id, candidate.path, candidate.changes_values FROM (
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord, entry.changes_values
+                  FROM sql_subject_lookup entry
+                  WHERE entry.tenant_id = $2
+                    AND entry.source_id = original.source_id AND entry.kind = original.kind
+                    AND entry.identity_hash = original_subject.identity_hash
+                    AND entry.identity = original_subject.identity
+                    AND octet_length(entry.path) <= 2048
+                    AND entry.path > (original.metadata->>'path') COLLATE \"C\"
+                  ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+                  LIMIT 1)
+                 UNION ALL
+                 (SELECT entry.chunk_id AS id, entry.path, entry.ord, entry.changes_values
+                  FROM sql_subject_lookup entry
+                  WHERE entry.tenant_id = $2
+                    AND entry.source_id = original.source_id AND entry.kind = original.kind
+                    AND entry.identity_hash = original_subject.identity_hash
+                    AND entry.identity = original_subject.identity
+                    AND octet_length(entry.path) > 2048
+                    AND entry.path > (original.metadata->>'path') COLLATE \"C\"
+                  ORDER BY entry.path DESC, entry.ord DESC, entry.chunk_id DESC
+                  LIMIT 1)
+             ) candidate
+             ORDER BY candidate.path DESC, candidate.ord DESC, candidate.id DESC
+             LIMIT 1
+         ) latest
+         WHERE base.id = ANY($1) AND base.tenant_id = $2
+         ORDER BY base.id, latest.path COLLATE \"C\" DESC, latest.id",
+    )
+    .bind(&ids)
+    .bind(f.tenant_id)
+    .fetch_all(conn)
+    .await?;
+    let representatives: HashMap<i64, i64> = origins
+        .iter()
+        .flat_map(|(&id, aliases)| aliases.iter().map(move |&alias| (alias, id)))
+        .collect();
+    let alias_changes: Vec<SqlChange> = changes
+        .iter()
+        .filter_map(|change| {
+            let &origin = representatives.get(&change.origin)?;
+            (origin != change.origin).then(|| SqlChange {
+                origin,
+                ..change.clone()
+            })
+        })
+        .collect();
+    // Keep actual origins too: an alias can itself become a companion of another subject.
+    changes.extend(alias_changes);
+    Ok(promote_sql(fused, &changes, usize::MAX))
+}
+
+fn promote_sql(fused: Vec<(i64, f64)>, changes: &[SqlChange], k: usize) -> SqlExpansion {
+    let mut by_origin: HashMap<i64, Vec<&SqlChange>> = HashMap::new();
+    let mut annotations: HashMap<i64, Vec<String>> = HashMap::new();
+    for change in changes {
+        by_origin.entry(change.origin).or_default().push(change);
+        let paths = annotations.entry(change.origin).or_default();
+        if !paths.contains(&change.path) {
+            paths.push(change.path.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (id, score) in fused {
+        // Expand value changes first, then the original, then ordinary companions. A newer
+        // hit already emitted at its own better rank keeps that earlier position.
+        let mut stack = vec![(id, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            if expanded {
+                seen.insert(id);
+                out.push((id, score));
+                if out.len() == k {
+                    return (out, annotations);
+                }
+                if let Some(changes) = by_origin.get(&id) {
+                    stack.extend(
+                        changes
+                            .iter()
+                            .rev()
+                            .filter(|change| !change.changes_values)
+                            .map(|change| (change.id, false)),
+                    );
+                }
+            } else {
+                stack.push((id, true));
+                if let Some(changes) = by_origin.get(&id) {
+                    stack.extend(
+                        changes
+                            .iter()
+                            .rev()
+                            .filter(|change| change.changes_values)
+                            .map(|change| (change.id, false)),
+                    );
+                }
+            }
+        }
+    }
+    (out, annotations)
 }
 
 /// The filters both branches share.
@@ -648,6 +875,7 @@ mod tests {
             symbols: Vec::new(),
             text: text.to_string(),
             score: 1.0 / id as f64,
+            later_changes: Vec::new(),
         };
         let found = collapse_duplicates(
             vec![
@@ -659,7 +887,9 @@ mod tests {
                 make(6, "best", "same"),
             ],
             3,
-        );
+            &HashMap::new(),
+        )
+        .0;
         assert_eq!(found.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), [1, 5]);
         assert_eq!(found[0].also_in, ["a", "z"]);
         assert!(found[1].also_in.is_empty());
@@ -684,6 +914,53 @@ mod tests {
         assert_eq!(clamp_k(50), 50);
         assert_eq!(clamp_k(51), 50);
         assert_eq!(clamp_k(usize::MAX), 50);
+    }
+
+    #[test]
+    fn sql_companions_are_newest_first_unique_and_bounded() {
+        let changes = [
+            SqlChange {
+                origin: 1,
+                id: 2,
+                path: "002.sql".into(),
+                changes_values: true,
+            },
+            SqlChange {
+                origin: 2,
+                id: 3,
+                path: "003.sql".into(),
+                changes_values: true,
+            },
+        ];
+        let fused = vec![(1, 0.03), (2, 0.02), (3, 0.01), (4, 0.005)];
+        let (hits, notes) = promote_sql(fused.clone(), &changes, 5);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [3, 2, 1, 4]
+        );
+        assert_eq!(notes[&1], ["002.sql"]);
+        assert_eq!(notes[&2], ["003.sql"]);
+        assert_eq!(promote_sql(fused, &changes, 1).0, [(3, 0.03)]);
+    }
+
+    #[test]
+    fn ordinary_companions_follow_their_parent_without_reordering_other_hits() {
+        let change = SqlChange {
+            origin: 2,
+            id: 4,
+            path: "app:002.sql".into(),
+            changes_values: false,
+        };
+        let fused = vec![(1, 0.05), (2, 0.04), (3, 0.03), (4, 0.02), (5, 0.01)];
+        let ids = |hits: Vec<(i64, f64)>| hits.into_iter().map(|h| h.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(promote_sql(fused, std::slice::from_ref(&change), 50).0),
+            [1, 2, 4, 3, 5]
+        );
+        assert_eq!(
+            ids(promote_sql(vec![(4, 0.05), (1, 0.04), (2, 0.03)], &[change], 50).0),
+            [4, 1, 2]
+        );
     }
 
     #[test]
