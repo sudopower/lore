@@ -23,13 +23,16 @@ const PREFIX: &str = "Sources:\n\n";
 
 /// One numbered source: a header line, then the text in a fence cut to its first 120 lines.
 fn render_source(n: usize, hit: &Hit) -> String {
-    let header = match (&hit.path, hit.start_line, hit.end_line) {
+    let mut header = match (&hit.path, hit.start_line, hit.end_line) {
         (Some(path), Some(start), Some(end)) => {
             format!("[{n}] {path}:{start}-{end} ({})", hit.kind)
         }
         (Some(path), _, _) => format!("[{n}] {path} ({})", hit.kind),
         (None, _, _) => format!("[{n}] {} ({})", hit.title, hit.kind),
     };
+    if !hit.also_in.is_empty() {
+        header.push_str(&format!("; also in: {}", hit.also_in.join(", ")));
+    }
     let text = hit
         .text
         .lines()
@@ -71,6 +74,7 @@ mod tests {
             chunk_id: 1,
             document_id: Uuid::nil(),
             source: "sample".to_string(),
+            also_in: Vec::new(),
             kind: "code".to_string(),
             title: "Standup notes".to_string(),
             uri: None,
@@ -99,6 +103,15 @@ mod tests {
              [2] Standup notes (code)\n```\nmeeting notes\n```\n\n\
              Question: what is a?"
         );
+    }
+
+    #[test]
+    fn duplicate_sources_are_in_the_model_passage_header() {
+        let mut h = hit(Some("gen/agent.py"), "AGENT = 1");
+        h.also_in = vec!["sdk".to_string()];
+        let (msg, n) = fast_user_message("which agent?", &[h], 60_000);
+        assert_eq!(n, 1);
+        assert!(msg.contains("; also in: sdk\n```"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! Queries are runtime-checked and bind every value. The one built string is the tsquery text of
 //! the lexical branch, which is itself passed as a bind value.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -87,6 +87,8 @@ pub struct Hit {
     pub document_id: Uuid,
     /// The source name.
     pub source: String,
+    /// Other eligible sources with exactly the same chunk text.
+    pub also_in: Vec<String>,
     /// The document kind.
     pub kind: String,
     pub title: String,
@@ -121,6 +123,8 @@ struct HitRow {
     end_line: Option<i32>,
     symbols: Vec<String>,
     text: String,
+    is_test: bool,
+    is_generated: bool,
 }
 
 impl HitRow {
@@ -144,6 +148,7 @@ impl HitRow {
             chunk_id: self.id,
             document_id: self.document_id,
             source: self.source,
+            also_in: Vec::new(),
             kind: self.kind,
             title: self.title,
             uri: rendered.or(self.doc_uri),
@@ -236,20 +241,28 @@ pub async fn search(
         .take(ENUMERATION_LIMIT)
         .collect();
 
-    let mut fused = fuse(&[&lexical, &vector, &enumerations, &related]);
-    fused.truncate(k);
+    let fused = fuse(&[&lexical, &vector, &enumerations, &related]);
     if fused.is_empty() {
         tx.commit().await?;
         return Ok(Vec::new());
     }
 
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
-    let mut by_id = hits_by_id(&mut *tx, query.tenant_id, &ids).await?;
+    let mut by_id =
+        hit_rows_by_id(&mut *tx, query.tenant_id, &ids, filter.kinds, filter.source).await?;
     tx.commit().await?;
-    Ok(fused
+    let intent = RankingIntent::new(q);
+    let mut hits: Vec<Hit> = fused
         .into_iter()
-        .filter_map(|(id, score)| by_id.remove(&id).map(|hit| Hit { score, ..hit }))
-        .collect())
+        .filter_map(|(id, score)| {
+            by_id.remove(&id).map(|row| {
+                let weight = intent.weight(&row);
+                row.into_hit(score * weight)
+            })
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(collapse_duplicates(hits, k))
 }
 
 /// The tenant's chunks with these ids as hits with score 0, by id. One query for all rows; ids of
@@ -262,22 +275,149 @@ pub(crate) async fn hits_by_id<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
+    Ok(hit_rows_by_id(executor, tenant_id, ids, None, None)
+        .await?
+        .into_iter()
+        .map(|(id, row)| (id, row.into_hit(0.0)))
+        .collect())
+}
+
+async fn hit_rows_by_id<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    ids: &[i64],
+    kinds: Option<&[String]>,
+    source: Option<&str>,
+) -> Result<HashMap<i64, HitRow>, AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows: Vec<HitRow> = sqlx::query_as(
         "SELECT c.id, c.document_id, s.name AS source, d.kind, d.title, d.uri AS doc_uri,
                 left(d.metadata->>'path', 2048) AS path,
                 CASE WHEN d.kind = 'session' THEN d.external_id END AS external_id,
                 d.metadata->>'commit' AS commit,
-                s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text
+                s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text,
+                c.is_test, c.is_generated
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
-         WHERE c.id = ANY($1) AND c.tenant_id = $2",
+         WHERE c.id = ANY($1) AND c.tenant_id = $2
+           AND ($3::text[] IS NULL OR d.kind = ANY($3))
+           AND ($4::text IS NULL OR s.name = $4)",
     )
     .bind(ids)
     .bind(tenant_id)
+    .bind(kinds)
+    .bind(source)
     .fetch_all(executor)
     .await?;
-    Ok(rows.into_iter().map(|r| (r.id, r.into_hit(0.0))).collect())
+    Ok(rows.into_iter().map(|r| (r.id, r)).collect())
+}
+
+/// Small priors leave all chunks retrievable. Explicit requests for tests/generated output
+/// remove the corresponding penalty rather than hiding those files behind production code.
+struct RankingIntent {
+    tests: bool,
+    generated: bool,
+    behavioral: bool,
+}
+
+impl RankingIntent {
+    fn new(q: &str) -> Self {
+        let terms: Vec<String> = q
+            .split(|c: char| !c.is_alphanumeric())
+            .map(str::to_lowercase)
+            .collect();
+        Self {
+            tests: terms.iter().any(|s| {
+                matches!(
+                    s.as_str(),
+                    "test"
+                        | "tests"
+                        | "testing"
+                        | "fixture"
+                        | "fixtures"
+                        | "mock"
+                        | "mocks"
+                        | "snapshot"
+                        | "snapshots"
+                        | "e2e"
+                )
+            }),
+            generated: terms
+                .iter()
+                .any(|s| matches!(s.as_str(), "generated" | "protobuf" | "codegen")),
+            behavioral: !terms
+                .iter()
+                .any(|s| matches!(s.as_str(), "readme" | "documentation" | "docs"))
+                && terms.iter().any(|s| {
+                    matches!(
+                        s.as_str(),
+                        "limits"
+                            | "limit"
+                            | "enforces"
+                            | "enforce"
+                            | "rejects"
+                            | "reject"
+                            | "happens"
+                            | "does"
+                    )
+                }),
+        }
+    }
+
+    fn weight(&self, row: &HitRow) -> f64 {
+        let mut weight = 1.0;
+        if row.is_test && !self.tests {
+            weight *= 0.7;
+        }
+        if row.is_generated && !self.generated {
+            weight *= 0.7;
+        }
+        let readme = row.path.as_deref().is_some_and(|path| {
+            path.rsplit('/').next().is_some_and(|name| {
+                name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme.mdx")
+            })
+        });
+        if self.behavioral && readme {
+            weight *= 0.9;
+        }
+        weight
+    }
+}
+
+/// Collapse identical text shared across sources. Repeats confined to one source retain
+/// separate locations. Compare full text, never snippets or a hash alone, before k.
+fn collapse_duplicates(hits: Vec<Hit>, k: usize) -> Vec<Hit> {
+    let mut first_source: HashMap<&str, &str> = HashMap::new();
+    let mut shared: HashSet<String> = HashSet::new();
+    for hit in &hits {
+        if let Some(source) = first_source.insert(&hit.text, &hit.source)
+            && source != hit.source
+        {
+            shared.insert(hit.text.clone());
+        }
+    }
+    let mut groups: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Hit> = Vec::new();
+    for hit in hits {
+        if shared.contains(&hit.text) {
+            if let Some(&i) = groups.get(&hit.text) {
+                if out[i].source != hit.source && !out[i].also_in.contains(&hit.source) {
+                    out[i].also_in.push(hit.source);
+                }
+                continue;
+            }
+            groups.insert(hit.text.clone(), out.len());
+        }
+        out.push(hit);
+    }
+    for hit in &mut out {
+        hit.also_in.sort();
+    }
+    out.truncate(k);
+    out
 }
 
 /// The filters both branches share.
@@ -490,6 +630,40 @@ mod tests {
     use super::*;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn duplicate_collapse_uses_full_text_and_keeps_the_best_location() {
+        let make = |id: i64, source: &str, text: &str| Hit {
+            chunk_id: id,
+            document_id: Uuid::nil(),
+            source: source.to_string(),
+            also_in: Vec::new(),
+            kind: "code".to_string(),
+            title: "agent".to_string(),
+            uri: None,
+            path: None,
+            external_id: None,
+            start_line: None,
+            end_line: None,
+            symbols: Vec::new(),
+            text: text.to_string(),
+            score: 1.0 / id as f64,
+        };
+        let found = collapse_duplicates(
+            vec![
+                make(1, "best", "same"),
+                make(2, "z", "same"),
+                make(3, "a", "same"),
+                make(4, "a", "same"),
+                make(5, "best", "same\nmore"),
+                make(6, "best", "same"),
+            ],
+            3,
+        );
+        assert_eq!(found.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), [1, 5]);
+        assert_eq!(found[0].also_in, ["a", "z"]);
+        assert!(found[1].also_in.is_empty());
+    }
 
     #[test]
     fn snippet_is_the_first_40_lines() {
