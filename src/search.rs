@@ -355,7 +355,7 @@ async fn sql_changes(
              LIMIT 1
          ) latest
          WHERE base.id = ANY($1) AND base.tenant_id = $2
-         ORDER BY origin, path COLLATE \"C\" DESC, id",
+         ORDER BY base.id, latest.path COLLATE \"C\" DESC, latest.id",
     )
     .bind(&ids)
     .bind(f.tenant_id)

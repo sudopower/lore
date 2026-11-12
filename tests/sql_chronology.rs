@@ -40,6 +40,16 @@ async fn sql(state: &AppState, tenant: Uuid, source: &str, path: &str, text: &st
 }
 
 async fn find(state: &AppState, tenant: Uuid, q: &str, k: usize) -> Vec<Hit> {
+    find_in(state, tenant, q, k, Some("app")).await
+}
+
+async fn find_in(
+    state: &AppState,
+    tenant: Uuid,
+    q: &str,
+    k: usize,
+    source: Option<&str>,
+) -> Vec<Hit> {
     search(
         &state.pool,
         state.embedder.clone(),
@@ -48,7 +58,7 @@ async fn find(state: &AppState, tenant: Uuid, q: &str, k: usize) -> Vec<Hit> {
             q: q.into(),
             k,
             kinds: Some(vec!["code".into()]),
-            source: Some("app".into()),
+            source: source.map(str::to_string),
         },
     )
     .await
@@ -122,7 +132,80 @@ async fn current_values_search_and_both_answer_modes_include_the_change(pool: Pg
         assert!(prompt.contains("[2] migrations/001_accounts.sql:1-1 (code); later SQL changes"));
         assert!(prompt.contains("'archived'"));
     }
-    assert_eq!(find(&state, tenant, "account statuses", 1).await.len(), 1);
+    let smallest = find(&state, tenant, "account statuses", 1).await;
+    assert_eq!(smallest.len(), 1);
+    assert_eq!(smallest[0].path.as_deref(), Some("migrations/002_archived.sql"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn collapsed_sql_alias_keeps_its_own_source_chronology(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let (tenant, _) = create_tenant_key(&test_router(state.clone()), "sql-alias", &["read"]).await;
+    sql(&state, tenant, "a", "001.sql", CREATE).await;
+    sql(&state, tenant, "b", "001.sql", CREATE).await;
+    sql(&state, tenant, "b", "003.sql", ALTER).await;
+    let hits = find_in(&state, tenant, "account statuses", 5, None).await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert_eq!(hits[0].source, "b");
+    assert_eq!(hits[0].path.as_deref(), Some("003.sql"));
+    assert_eq!(hits[1].path.as_deref(), Some("001.sql"));
+    assert_eq!(hits[1].source, "a");
+    assert_eq!(hits[1].also_in, ["b"]);
+    assert_eq!(hits[1].later_changes, ["b:003.sql"]);
+    let scoped_a = find_in(&state, tenant, "account statuses", 5, Some("a")).await;
+    assert_eq!(scoped_a.len(), 1);
+    assert!(scoped_a[0].later_changes.is_empty());
+    assert!(scoped_a[0].also_in.is_empty());
+    let scoped_b = find_in(&state, tenant, "account statuses", 5, Some("b")).await;
+    assert_eq!(scoped_b.len(), 2);
+    assert_eq!(scoped_b[0].source, "b");
+    assert_eq!(scoped_b[0].path.as_deref(), Some("003.sql"));
+    assert_eq!(scoped_b[1].path.as_deref(), Some("001.sql"));
+    assert_eq!(scoped_b[1].later_changes, ["b:003.sql"]);
+    assert!(scoped_b.iter().all(|h| h.also_in.is_empty()));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cross_source_duplicates_do_not_erase_repeated_migration_positions(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let (tenant, _) = create_tenant_key(&test_router(state.clone()), "sql-history", &["read"]).await;
+    sql(&state, tenant, "a", "001.sql", CREATE).await;
+    sql(&state, tenant, "a", "002.sql", CREATE).await;
+    sql(&state, tenant, "b", "001.sql", CREATE).await;
+    sql(&state, tenant, "b", "003.sql", ALTER).await;
+    for k in [1, 2, 3, 5] {
+        let hits = find_in(&state, tenant, "account statuses", k, None).await;
+        assert!(hits.len() <= k, "{k}: {hits:?}");
+        if let Some(old) = hits.iter().position(|h| h.path.as_deref() == Some("001.sql")) {
+            assert!(hits[..old].iter().any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql")), "{k}: {hits:?}");
+            assert!(hits[..old].iter().any(|h| h.source == "b" && h.path.as_deref() == Some("003.sql")), "{k}: {hits:?}");
+            assert!(hits[old].later_changes.contains(&"a:002.sql".into()));
+            assert!(hits[old].later_changes.contains(&"b:003.sql".into()));
+        }
+        if k == 5 {
+            assert_eq!(hits.len(), 3, "{hits:?}");
+            assert!(hits.iter().any(|h| h.source == "a" && h.path.as_deref() == Some("002.sql") && h.later_changes.is_empty()));
+            assert!(hits.iter().any(|h| h.path.as_deref() == Some("001.sql") && h.also_in == ["b"]));
+        }
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn collapsed_newest_companions_keep_both_sources_and_warnings(pool: PgPool) {
+    let state = test_state(pool, &std::env::temp_dir());
+    let (tenant, _) = create_tenant_key(&test_router(state.clone()), "sql-companions", &["read"]).await;
+    for source in ["a", "b"] {
+        sql(&state, tenant, source, "001.sql", CREATE).await;
+        sql(&state, tenant, source, "003.sql", ALTER).await;
+    }
+    let hits = find_in(&state, tenant, "account statuses", 5, None).await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert_eq!(hits[0].path.as_deref(), Some("003.sql"));
+    assert_eq!(hits[1].path.as_deref(), Some("001.sql"));
+    assert_eq!(hits[0].also_in.len(), 1);
+    assert_eq!(hits[1].also_in.len(), 1);
+    assert!(hits[1].later_changes.contains(&"a:003.sql".into()));
+    assert!(hits[1].later_changes.contains(&"b:003.sql".into()));
 }
 
 struct CapturePrompt(std::sync::Arc<std::sync::Mutex<String>>);
