@@ -41,6 +41,10 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
 
+## Database connections
+
+`lore serve` and `lore migrate` establish two Postgres connections before startup continues, with an unchanged maximum of ten. The spare lets the immediate session poll and first authenticated request use existing backends instead of opening another connection on the request path. This costs one additional idle Postgres backend per process, and the database needs capacity for both startup connections. Further concurrent work can still grow the pool up to ten. Custom pools supplied by tests or library callers, including one-connection pools, are unchanged.
+
 ## The embedding model download
 
 With `LORE_EMBEDDER=fastembed`, the first start downloads bge-small-en-v1.5 (about 130 MB, five files of the `Xenova/bge-small-en-v1.5` repo) from `$HF_ENDPOINT` into `$LORE_DATA_DIR/models` before the server listens. Later starts find the files there and do not use the network.

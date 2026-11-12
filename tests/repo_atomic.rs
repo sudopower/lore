@@ -370,32 +370,162 @@ async fn publication_failure_rolls_back_deleted_files_and_new_documents(pool: Pg
 
 #[sqlx::test(migrations = "./migrations")]
 async fn search_snapshot_survives_publication_between_ranking_branches_and_hydration(pool: PgPool) {
-    let env = Env::new(pool, true).await;
-    let old = env.search().await;
+    let env = Env::new(pool.clone(), true).await;
+    std::fs::write(
+        env.repo.path().join("src/graph.rs"),
+        "pub fn persist() { let version = \"old\"; }\npub fn checkout() { persist(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        env.repo.path().join("src/graph_caller.rs"),
+        "pub fn driver() { checkout(); }\n",
+    )
+    .unwrap();
+    commit_all(&env.repo, "old graph");
+    assert_eq!(env.push(false).await.0, StatusCode::OK);
+    // Install before any graph query is prepared: adding an overload later does not
+    // necessarily invalidate an already cached PostgreSQL function binding.
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.unnest(text[]) RETURNS SETOF text LANGUAGE plpgsql AS $$
+         BEGIN
+           PERFORM pg_advisory_xact_lock(97413741);
+           RETURN QUERY SELECT pg_catalog.unnest($1);
+         END $$;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let uri = "/v1/search?q=checkout&source=sample&k=50";
+    let (status, old) = send(&env.router, "GET", uri, &env.key, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let scope = lore::callgraph::Scope {
+        tenant_id: env.tenant,
+        kinds: None,
+        source: Some("sample"),
+    };
+    assert_eq!(
+        lore::callgraph::related(&pool, &scope, "checkout")
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "the graph list must include the definition, caller and callee",
+    );
+    // This test-only exact overload intercepts the graph's text-array probe, not lexical,
+    // vector or indexing queries. It blocks expansion AFTER both ranking branches ran.
+    let mut locker = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(97413741)")
+        .execute(&mut *locker)
+        .await
+        .unwrap();
+    let router = env.router.clone();
+    let key = env.key.clone();
+    let search = tokio::spawn(async move { send(&router, "GET", uri, &key, Vec::new()).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                 WHERE datname=current_database() AND wait_event='advisory'
+                   AND query LIKE 'WITH matched AS MATERIALIZED%')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("graph expansion reached the advisory barrier");
+    std::fs::write(
+        env.repo.path().join("src/graph.rs"),
+        "pub fn persist() { let version = \"new\"; }\npub fn checkout() { persist(); persist(); }\n",
+    ).unwrap();
+    std::fs::remove_file(env.repo.path().join("src/graph_caller.rs")).unwrap();
+    std::fs::write(
+        env.repo.path().join("src/new_caller.rs"),
+        "pub fn new_driver() { checkout(); }\n",
+    )
+    .unwrap();
+    commit_all(&env.repo, "new graph");
+    assert_eq!(env.push(false).await.0, StatusCode::OK);
+    locker.commit().await.unwrap();
+    let (status, result) = search.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result, old,
+        "lexical/vector/graph/hydration must retain the pre-publication snapshot"
+    );
+    let (status, new) = send(&env.router, "GET", uri, &env.key, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(new, old);
+    assert!(
+        new["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["path"] == "src/new_caller.rs")
+    );
+    assert!(
+        !new["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["path"] == "src/graph_caller.rs")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn embedding_runs_before_the_one_search_connection_is_acquired(pool: PgPool) {
+    let env = Env::new(pool.clone(), true).await;
+    std::fs::write(
+        env.repo.path().join("src/graph.rs"),
+        "pub fn persist() {}\npub fn checkout() { persist(); }\n",
+    )
+    .unwrap();
+    commit_all(&env.repo, "graph");
+    assert_eq!(env.push(false).await.0, StatusCode::OK);
+    let small = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
     let gate = Gate::new(None, true, false);
-    let router = env.gated_router(gate.clone());
+    let mut state = env.state.clone();
+    state.pool = small.clone();
+    state.embedder = gate.clone();
+    let router = test_router(state);
     let key = env.key.clone();
     let search = tokio::spawn(async move {
         send(
             &router,
             "GET",
-            "/v1/search?q=repoatomic&source=sample&k=50",
+            "/v1/search?q=checkout&source=sample&k=50",
             &key,
             Vec::new(),
         )
         .await
     });
-    // search has run the lexical branch and is now waiting to embed its vector query.
     gate.wait().await;
-    env.change();
-    assert_eq!(env.push(false).await.0, StatusCode::OK);
-    assert_eq!(contents(&env.search().await), new_contents());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query("SELECT 1").execute(&small),
+    )
+    .await
+    .expect("query embedding must not hold the only connection")
+    .unwrap();
     gate.release();
-    let (status, result) = search.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        result, old,
-        "all branches and hydration must retain their original snapshot"
+    let (status, hits) = search.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{hits}");
+    assert!(
+        hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["path"] == "src/graph.rs")
     );
 }
 

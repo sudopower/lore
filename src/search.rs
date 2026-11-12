@@ -1,8 +1,10 @@
 //! Hybrid search: Postgres full-text ranking (good at exact names) fused with pgvector similarity
 //! (good at meaning) by Reciprocal Rank Fusion. A third list lifts the first few enumerations among
 //! the vector hits (enums, constant lists, seed rows): they answer "which X are there" but are
-//! easily outranked by the many chunks that only use X. The HTTP route, the CLI, fast answers and
-//! the MCP tools all call [`search`].
+//! easily outranked by the many chunks that only use X. A fourth list holds the chunks that define
+//! a symbol the query names, then their direct callers and callees ([`callgraph::related`]): "how
+//! does X reach Y" is answered by code that only mentions X by name. The HTTP route, the CLI, fast
+//! answers and the MCP tools all call [`search`].
 //!
 //! Queries are runtime-checked and bind every value. The one built string is the tsquery text of
 //! the lexical branch, which is itself passed as a bind value.
@@ -15,6 +17,7 @@ use pgvector::Vector;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::callgraph;
 use crate::embed::{Embedder, embed_query_async};
 use crate::error::AppError;
 use crate::repo::is_full_sha;
@@ -36,7 +39,7 @@ pub const DOCUMENT_KINDS: [&str; 4] = ["code", "doc", "session", "note"];
 const SNIPPET_LINES: usize = 40;
 
 /// Query words too common to point at the lines of a hit that matter.
-const STOP_WORDS: [&str; 40] = [
+pub(crate) const STOP_WORDS: [&str; 40] = [
     "the", "and", "for", "are", "what", "which", "how", "does", "with", "from", "this", "that",
     "can", "there", "their", "when", "where", "who", "why", "into", "its", "our", "use", "used",
     "any", "all", "each", "has", "have", "was", "were", "will", "would", "should", "could",
@@ -207,6 +210,13 @@ pub async fn search(
         source: query.source.as_deref(),
     };
 
+    let scope = callgraph::Scope {
+        tenant_id: query.tenant_id,
+        kinds: kinds.as_deref(),
+        source: query.source.as_deref(),
+    };
+    // Embed before acquiring the one connection shared by every ranking branch.
+    let embedding = embed_query_async(embedder, q.to_string()).await?;
     // A push can commit between any two queries, including ranking and hydration. One MVCC
     // snapshot keeps every branch on the same version, even when its old chunks are deleted.
     let mut tx = pool.begin().await?;
@@ -214,7 +224,8 @@ pub async fn search(
         .execute(&mut *tx)
         .await?;
     let lexical = lexical_branch(&mut tx, q, &filter).await?;
-    let vector_hits = vector_branch(&mut tx, embedder, q, &filter).await?;
+    let vector_hits = vector_branch(&mut tx, embedding, &filter).await?;
+    let related = callgraph::related_on(&mut tx, &scope, q).await?;
     let vector: Vec<i64> = vector_hits.iter().map(|(id, _)| *id).collect();
     // The enumerations the vector branch found, in its order: an enumeration far from the query
     // in meaning is not lifted, however few enumerations there are.
@@ -225,16 +236,32 @@ pub async fn search(
         .take(ENUMERATION_LIMIT)
         .collect();
 
-    let mut fused = fuse(&[&lexical, &vector, &enumerations]);
+    let mut fused = fuse(&[&lexical, &vector, &enumerations, &related]);
     fused.truncate(k);
     if fused.is_empty() {
         tx.commit().await?;
         return Ok(Vec::new());
     }
 
-    // One query for all rows; the tenant filter applies here too. Rows come back in any order,
-    // so they are put in the fused order afterwards.
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let mut by_id = hits_by_id(&mut *tx, query.tenant_id, &ids).await?;
+    tx.commit().await?;
+    Ok(fused
+        .into_iter()
+        .filter_map(|(id, score)| by_id.remove(&id).map(|hit| Hit { score, ..hit }))
+        .collect())
+}
+
+/// The tenant's chunks with these ids as hits with score 0, by id. One query for all rows; ids of
+/// other tenants and of deleted chunks are missing from the map.
+pub(crate) async fn hits_by_id<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    ids: &[i64],
+) -> Result<HashMap<i64, Hit>, AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows: Vec<HitRow> = sqlx::query_as(
         "SELECT c.id, c.document_id, s.name AS source, d.kind, d.title, d.uri AS doc_uri,
                 left(d.metadata->>'path', 2048) AS path,
@@ -246,16 +273,11 @@ pub async fn search(
          JOIN sources s ON s.id = d.source_id
          WHERE c.id = ANY($1) AND c.tenant_id = $2",
     )
-    .bind(&ids)
-    .bind(query.tenant_id)
-    .fetch_all(&mut *tx)
+    .bind(ids)
+    .bind(tenant_id)
+    .fetch_all(executor)
     .await?;
-    tx.commit().await?;
-    let mut by_id: HashMap<i64, HitRow> = rows.into_iter().map(|r| (r.id, r)).collect();
-    Ok(fused
-        .into_iter()
-        .filter_map(|(id, score)| by_id.remove(&id).map(|row| row.into_hit(score)))
-        .collect())
+    Ok(rows.into_iter().map(|r| (r.id, r.into_hit(0.0))).collect())
 }
 
 /// The filters both branches share.
@@ -266,14 +288,14 @@ struct Filter<'a> {
 }
 
 async fn lexical_branch(
-    conn: &mut PgConnection,
+    connection: &mut PgConnection,
     q: &str,
     f: &Filter<'_>,
 ) -> Result<Vec<i64>, AppError> {
     let lexemes: Vec<String> =
         sqlx::query_scalar("SELECT tsvector_to_array(to_tsvector('english', $1))")
             .bind(q)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *connection)
             .await?;
     let Some(tsquery) = or_query(&lexemes) else {
         return Ok(Vec::new());
@@ -293,28 +315,38 @@ async fn lexical_branch(
     .bind(f.kinds)
     .bind(f.source)
     .bind(BRANCH_LIMIT)
-    .fetch_all(conn)
+    .fetch_all(connection)
     .await?;
     Ok(ids)
 }
 
 /// The nearest chunks, best first, each with whether it is an enumeration.
 async fn vector_branch(
-    conn: &mut PgConnection,
-    embedder: Arc<dyn Embedder>,
-    q: &str,
+    connection: &mut PgConnection,
+    embedding: Vec<f32>,
     f: &Filter<'_>,
 ) -> Result<Vec<(i64, bool)>, AppError> {
-    let embedding = embed_query_async(embedder, q.to_string()).await?;
     // The filters are applied after the index scan, so let it keep scanning until it has enough
     // rows that pass them.
     sqlx::query("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
-        .execute(&mut *conn)
+        .execute(&mut *connection)
         .await?;
     sqlx::query("SET LOCAL hnsw.ef_search = 100")
-        .execute(&mut *conn)
+        .execute(&mut *connection)
         .await?;
-    let hits = sqlx::query_as(
+    // Exact source-scoped ranking avoids repeated document joins. Adding zero keeps the
+    // distance sort off HNSW, including its approximate candidate set and tie ordering.
+    // Source-null searches retain the existing approximate index path below.
+    let query = if f.source.is_some() {
+        "SELECT c.id, c.enumerates
+         FROM chunks c
+         WHERE c.tenant_id = $1
+           AND c.document_id = ANY(ARRAY(
+               SELECT d.id FROM documents d JOIN sources s ON s.id = d.source_id
+               WHERE ($2::text[] IS NULL OR d.kind = ANY($2)) AND s.name = $3))
+         ORDER BY (c.embedding <=> $4) + 0, c.id
+         LIMIT $5"
+    } else {
         "SELECT c.id, c.enumerates
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
@@ -322,15 +354,16 @@ async fn vector_branch(
          WHERE c.tenant_id = $1
            AND ($2::text[] IS NULL OR d.kind = ANY($2)) AND ($3::text IS NULL OR s.name = $3)
          ORDER BY c.embedding <=> $4, c.id
-         LIMIT $5",
-    )
-    .bind(f.tenant_id)
-    .bind(f.kinds)
-    .bind(f.source)
-    .bind(Vector::from(embedding))
-    .bind(BRANCH_LIMIT)
-    .fetch_all(conn)
-    .await?;
+         LIMIT $5"
+    };
+    let hits = sqlx::query_as(query)
+        .bind(f.tenant_id)
+        .bind(f.kinds)
+        .bind(f.source)
+        .bind(Vector::from(embedding))
+        .bind(BRANCH_LIMIT)
+        .fetch_all(connection)
+        .await?;
     Ok(hits)
 }
 
@@ -448,6 +481,9 @@ fn push_encoded_path(out: &mut String, path: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod exact_vector_tests;
 
 #[cfg(test)]
 mod tests {
